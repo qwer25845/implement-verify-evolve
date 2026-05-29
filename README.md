@@ -1,4 +1,6 @@
-# IVE — Implement · Verify · Evolve
+# Implement · Verify · Evolve
+
+> **I**mplement · **V**erify · **E**volve — *IVE* for short.
 
 A turnkey **autonomous dev loop** for LLM coding agents. Give it a task and it
 drives an implementer LLM and a reviewer LLM around a closed loop until the work

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""IVE - Implement / Verify / Evolve: a turnkey autonomous dev loop.
+"""Implement / Verify / Evolve (IVE): a turnkey autonomous dev loop.
 
 Given a task, it drives:
 
