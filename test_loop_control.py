@@ -34,6 +34,27 @@ check("escalate beats done", o.decide_next_action(True, mixed, 2, 10), "human_es
 # failing tests take priority over the (stale) review of an earlier state
 check("fix_tests beats review", o.decide_next_action(False, APPROVE_DONE, 2, 10), "fix_tests")
 
+# parse_verdict: only a line-start VERDICT counts; a stray prose mention -> '?'
+import review_loop as rl
+import scoring as sc
+check("verdict line", rl.parse_verdict("VERDICT: APPROVE\nHEAD: x"), "APPROVE")
+check("verdict lowercase", rl.parse_verdict("verdict: request_changes"), "REQUEST_CHANGES")
+check("verdict in prose ignored", rl.parse_verdict("we lean to VERDICT: APPROVE here"), "?")
+check("no verdict", rl.parse_verdict("nothing here"), "?")
+
+# verdict_anomaly: verdict <-> findings contradictions go to a human
+check("missing verdict", rl.verdict_anomaly("?", []), True)
+check("request_changes + no findings", rl.verdict_anomaly("REQUEST_CHANGES", []), True)
+check("approve + warning", rl.verdict_anomaly("APPROVE", sc.parse_findings("- [WARNING/x] a")), True)
+check("approve clean ok", rl.verdict_anomaly("APPROVE", sc.parse_findings("- [SUGGESTION/test] a")), False)
+check("request_changes + findings ok", rl.verdict_anomaly("REQUEST_CHANGES", sc.parse_findings("- [WARNING/x] a")), False)
+
+# merged_cfg must DEEP-merge weights (partial override keeps CRITICAL/WARNING)
+m = rl.merged_cfg({"weights": {"SUGGESTION/style": 2}})
+check("partial weights keeps CRITICAL", m["weights"]["CRITICAL"], 100)
+check("partial weights keeps WARNING", m["weights"]["WARNING"], 40)
+check("partial weights applies override", m["weights"]["SUGGESTION/style"], 2)
+
 if fails:
     print("FAIL:")
     for f in fails:

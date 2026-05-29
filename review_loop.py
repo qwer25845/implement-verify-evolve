@@ -39,13 +39,36 @@ def _load_json(path, default):
 
 
 def merged_cfg(cfg):
-    """Fill scoring defaults so a partial config still works."""
+    """Fill scoring defaults so a partial config still works.
+
+    ``weights`` is DEEP-merged (a partial override must not drop the CRITICAL /
+    WARNING defaults to 0 and break escalation)."""
     out = dict(scoring.DEFAULT_CONFIG)
-    for k in ("weights", "default_suggestion_weight", "stop_cutoff",
-              "stop_consecutive", "escalate_min"):
+    out["weights"] = dict(scoring.DEFAULT_CONFIG["weights"])
+    if isinstance(cfg.get("weights"), dict):
+        out["weights"].update(cfg["weights"])
+    for k in ("unknown_type_weight", "stop_cutoff", "stop_consecutive",
+              "stop_no_escalate_consecutive", "escalate_min"):
         if k in cfg:
             out[k] = cfg[k]
     return out
+
+
+def parse_verdict(text):
+    """Extract the verdict from a VERDICT: line (must start a line, not appear in
+    prose). Returns 'APPROVE' / 'REQUEST_CHANGES' / '?' (the last forces a human)."""
+    m = re.search(r"(?mi)^\s*VERDICT:\s*(APPROVE|REQUEST_CHANGES)\b", text or "")
+    return m.group(1).upper() if m else "?"
+
+
+def verdict_anomaly(verdict, findings):
+    """True if the verdict contradicts the findings (a reviewer error that must
+    go to a human): no/blank verdict, REQUEST_CHANGES with no findings, or
+    APPROVE alongside a CRITICAL/WARNING."""
+    sevs = {f.get("severity") for f in findings}
+    return (verdict == "?"
+            or (verdict == "REQUEST_CHANGES" and not findings)
+            or (verdict == "APPROVE" and bool({"CRITICAL", "WARNING"} & sevs)))
 
 
 def build_prompt(cfg, head, patch_path):
@@ -106,24 +129,31 @@ def run_round(cfg, work_dir):
     z = _run(cmd, cwd=cfg.get("reviewer_cwd"), env=env, timeout=cfg.get("timeout", 600))
     review = (z.stdout or "").strip()
 
-    vm = re.search(r"VERDICT:\s*(APPROVE|REQUEST_CHANGES)", review)
-    verdict = vm.group(1) if vm else "?"
+    verdict = parse_verdict(review)
     findings = scoring.parse_findings(review)
+    nh = scoring.needs_human(findings) or verdict_anomaly(verdict, findings)
     score = scoring.score_review(findings, score_cfg)
     escalate, apply_ = scoring.classify(findings, score_cfg)
+    esc_str = [scoring.tag_str(f) for f in escalate] or (["NEEDS_HUMAN"] if nh else [])
 
-    state = _load_json(state_file, {"consecutive_low": 0, "rounds": []})
-    stop, consecutive = scoring.decide_stop(score, verdict, state.get("consecutive_low", 0), score_cfg)
-    state["consecutive_low"] = consecutive
+    escalated = bool(esc_str)
+    state = _load_json(state_file, {"consecutive_low": 0, "consecutive_no_escalate": 0, "rounds": []})
+    stop, low_streak, no_esc_streak, reason = scoring.decide_convergence(
+        score, verdict, escalated,
+        state.get("consecutive_low", 0), state.get("consecutive_no_escalate", 0), score_cfg)
+    state["consecutive_low"] = low_streak
+    state["consecutive_no_escalate"] = no_esc_streak
     state.setdefault("rounds", []).append({
-        "head": head, "verdict": verdict, "score": score,
-        "findings": [f"{s}/{t or '-'}" for s, t in findings],
-        "consecutive_low": consecutive, "stop": stop})
+        "head": head, "verdict": verdict, "score": score, "needs_human": nh,
+        "findings": [scoring.tag_str(f) for f in findings],
+        "consecutive_low": low_streak, "consecutive_no_escalate": no_esc_streak,
+        "stop": stop, "stop_reason": reason})
 
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     with open(log_file, "a", encoding="utf-8") as fh:
-        fh.write(f"\n\n## Review round - {ts} - HEAD {head} - "
-                 f"score={score} consec_low={consecutive} {'STOP' if stop else 'CONTINUE'}\n\n")
+        fh.write(f"\n\n## Review round - {ts} - HEAD {head} - score={score} "
+                 f"consec_low={low_streak} no_esc={no_esc_streak} "
+                 f"{('STOP:' + reason) if stop else 'CONTINUE'}\n\n")
         fh.write(review if review else "(empty review - see stderr)\n")
         fh.write("\n")
     with open(state_file, "w", encoding="utf-8") as fh:
@@ -131,10 +161,11 @@ def run_round(cfg, work_dir):
 
     return {
         "head": head, "verdict": verdict, "score": score, "review": review,
-        "findings": [f"{s}/{t or '-'}" for s, t in findings],
-        "escalate": [f"{s}/{t or '-'}" for s, t in escalate],
-        "apply": [f"{s}/{t or '-'}" for s, t in apply_],
-        "stop": stop, "consecutive_low": consecutive,
+        "findings": [scoring.tag_str(f) for f in findings],
+        "escalate": esc_str,
+        "apply": [scoring.tag_str(f) for f in apply_],
+        "stop": stop, "stop_reason": reason, "needs_human": nh,
+        "consecutive_low": low_streak, "consecutive_no_escalate": no_esc_streak,
         "ok": bool(review), "stderr": (z.stderr or "")[-1500:],
     }
 
@@ -158,8 +189,9 @@ def main():
     print("VERDICT:", r["verdict"])
     print("FINDINGS:", r["findings"] or "none")
     print("SCORE:", r["score"])
-    print("CONSECUTIVE_LOW:", r["consecutive_low"])
-    print("DECISION:", "STOP - converged" if r["stop"] else "CONTINUE")
+    print("CONSECUTIVE_LOW:", r["consecutive_low"], "/", scoring.DEFAULT_CONFIG["stop_consecutive"],
+          " NO_ESCALATE:", r["consecutive_no_escalate"], "/", scoring.DEFAULT_CONFIG["stop_no_escalate_consecutive"])
+    print("DECISION:", f"STOP - converged ({r['stop_reason']})" if r["stop"] else "CONTINUE")
     print("ESCALATE_TO_HUMAN:", r["escalate"] or "none")
     print("APPLY_AUTOMATICALLY:", r["apply"] or "none")
     return 0

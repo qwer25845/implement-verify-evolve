@@ -31,9 +31,10 @@
     "SUGGESTION/consistency": 4,
     "SUGGESTION/style": 1
   },
-  "default_suggestion_weight": 4,
+  "unknown_type_weight": 15,
   "stop_cutoff": 5,
   "stop_consecutive": 2,
+  "stop_no_escalate_consecutive": 3,
   "escalate_min": 40,
 
   "log_file": "review-log.md",

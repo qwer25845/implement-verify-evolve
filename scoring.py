@@ -1,101 +1,166 @@
-"""Pure scoring / stopping logic for the LLM review loop.
+"""Pure scoring / stopping logic for the review loop.
 
-No I/O — fully unit-testable. The review loop is reviewer-agnostic: any reviewer
-LLM is told (via the injected legend below) to tag each finding as
-``[SEVERITY/TYPE]``; this module turns those tags into a numeric value and
-decides when the loop has converged.
+No I/O — fully unit-testable. The reviewer tags each finding `[SEVERITY/TYPE]`
+(see SCORING_RUBRIC.md, the shared judgement guide). This module turns those tags
+into a numeric value and decides when the loop has converged.
 
-Stopping rule: when a review's summed finding-value is <= ``stop_cutoff`` for
-``stop_consecutive`` APPROVE rounds in a row, the loop is converged. CRITICAL /
-WARNING findings are heavy enough that they can never count as "low", so blocking
-work never triggers an early stop.
+Fail-safe principle: an unknown severity, an undocumented type, or a malformed
+finding line is NEVER silently scored 0. Unknown severities and unparseable lines
+are weighted at `escalate_min` and flag the round `needs_human`, so a broken or
+ambiguous review can never be silently converged away.
 """
 import re
 
-# Default value index + thresholds. Override per-project via config.
+KNOWN_SEVERITIES = ("CRITICAL", "WARNING", "SUGGESTION")
+DOCUMENTED_TYPES = ("security", "compatibility", "reliability", "correctness",
+                    "test", "docs", "maintainability", "consistency", "style")
+
 DEFAULT_CONFIG = {
-    # Weight = how much acting on a finding is worth. Severity dominates;
-    # SUGGESTION is refined by TYPE.
     "weights": {
-        "CRITICAL": 100,                # blocks merge — always act
-        "WARNING": 40,                  # should fix — escalate to a human
-        "SUGGESTION/correctness": 15,   # claimed-but-untested behaviour / real risk
-        "SUGGESTION/test": 10,          # missing/weak test for existing behaviour
-        "SUGGESTION/docs": 8,           # doc <-> code mismatch
-        "SUGGESTION/consistency": 4,    # counts, naming, internal mismatch
-        "SUGGESTION/style": 1,          # subjective polish / nice-to-have / future
+        "CRITICAL": 100,                  # certain break / data / security / merge-block
+        "WARNING": 40,                    # reproducible defect, fix before merge
+        "SUGGESTION/security": 25,        # plausible security hardening
+        "SUGGESTION/compatibility": 20,   # may break existing API/config/callers
+        "SUGGESTION/reliability": 15,     # race / flake / silent failure / leak
+        "SUGGESTION/correctness": 15,     # plausible logic risk (unproven)
+        "SUGGESTION/test": 10,            # missing/weak test
+        "SUGGESTION/docs": 8,             # doc/config mismatch
+        "SUGGESTION/maintainability": 6,  # brittle structure / duplication
+        "SUGGESTION/consistency": 4,      # naming/count/example mismatch
+        "SUGGESTION/style": 1,            # subjective polish
     },
-    "default_suggestion_weight": 4,     # SUGGESTION with missing/unknown TYPE
-    "stop_cutoff": 5,                   # a review scoring <= this is "low value"
-    "stop_consecutive": 2,              # stop after this many low reviews in a row
-    "escalate_min": 40,                 # findings >= this are surfaced to a human
+    "unknown_type_weight": 15,            # SUGGESTION with a missing/undocumented type (never style/1)
+    "stop_cutoff": 5,                     # a review scoring <= this is "low value"
+    "stop_consecutive": 2,                # stop after this many low reviews in a row
+    "stop_no_escalate_consecutive": 3,    # OR stop after this many rounds with no escalate
+    "escalate_min": 40,                   # findings >= this go to a human
 }
 
-VALID_TYPES = ("correctness", "test", "docs", "consistency", "style")
-
-# Injected into every review prompt so any reviewer LLM emits the same
-# machine-scoreable tags — this is the shared convention.
+# Compact decision tree injected into the review prompt (full guide: SCORING_RUBRIC.md).
 FINDINGS_LEGEND = (
-    "Tag EVERY finding as [SEVERITY/TYPE].\n"
-    "SEVERITY: CRITICAL (blocks merge) | WARNING (should fix) | SUGGESTION (optional).\n"
-    "TYPE: correctness (logic/behaviour risk) | test (missing/weak test) | "
-    "docs (doc<->code mismatch) | consistency (counts, naming, internal mismatch) | "
-    "style (subjective polish / nice-to-have / future hardening).\n"
+    "Tag EVERY finding as [SEVERITY/TYPE] on its own '- ' bullet. Decision tree:\n"
+    "SEVERITY (top-down, first match):\n"
+    "  CRITICAL  - certainly breaks runtime/tests/data/security now; merge-blocking.\n"
+    "  WARNING   - reproducible defect on a real user/compat path; fix before merge.\n"
+    "  SUGGESTION- plausible-but-unproven, or optional/polish.\n"
+    "TYPE: security | compatibility | reliability | correctness | test | docs | "
+    "maintainability | consistency | style. Use the most specific domain "
+    "(security/compatibility/reliability before correctness).\n"
+    "Verdict: REQUEST_CHANGES if any CRITICAL/WARNING or it must be fixed before "
+    "merge; APPROVE only if no findings or only low-value optional suggestions.\n"
+    "Use EXACTLY this format. A malformed line or an unknown SEVERITY is treated "
+    "as needing human review; an unknown TYPE is scored conservatively. Neither "
+    "is ever ignored.\n"
     "Example: - [SUGGESTION/test] Add a regression test for the empty-input path."
 )
 
+_STRICT = re.compile(r"^-\s*\[\s*([A-Za-z]+)\s*(?:/\s*([A-Za-z]+)\s*)?\]")
 
-def parse_findings(review_text):
-    """Return a list of (severity, type_or_None) from a review body.
 
-    Recognises lines like ``- [SUGGESTION/test] ...`` (tolerant of case and
-    spacing). An explicit ``- none`` line yields no finding.
+def parse_findings(text):
+    """Return a list of finding dicts {severity, type, status}.
+
+    status: 'ok' | 'unknown_severity' | 'unknown_type' | 'unparseable'.
+    A '- none' line yields nothing. A finding-like line that breaks format
+    (wrong bullet, tag-in-prose, malformed brackets) becomes 'unparseable'
+    rather than being dropped.
     """
     findings = []
-    for line in review_text.splitlines():
+    for line in text.splitlines():
         s = line.strip()
-        if re.match(r"^-\s*none\b", s, re.IGNORECASE):
+        if not s or re.match(r"^-\s*none\b", s, re.IGNORECASE):
             continue
-        m = re.match(r"^-\s*\[\s*([A-Za-z]+)\s*(?:/\s*([A-Za-z]+)\s*)?\]", s)
-        if not m:
+        m = _STRICT.match(s)
+        if m:
+            sev = m.group(1).upper()
+            typ = (m.group(2) or "").lower() or None
+            if sev not in KNOWN_SEVERITIES:
+                findings.append({"severity": sev, "type": typ, "status": "unknown_severity"})
+            elif sev == "SUGGESTION" and (typ is None or typ not in DOCUMENTED_TYPES):
+                # TYPE is mandatory; missing or undocumented -> conservative, flagged.
+                findings.append({"severity": sev, "type": typ, "status": "unknown_type"})
+            else:
+                findings.append({"severity": sev, "type": typ, "status": "ok"})
             continue
-        sev = m.group(1).upper()
-        typ = (m.group(2) or "").lower() or None
-        findings.append((sev, typ))
+        # Not strict. Treat as a malformed finding (never silently drop) when it is
+        # either a finding-like bullet without a clean tag (e.g. "- Missing test",
+        # "* [WARNING/x]", "1. ..."), or a severity-like tag buried in prose.
+        is_bullet = bool(re.match(r"^([-*+]|\d+[.)])\s+\S", s))
+        lead = re.search(r"\[\s*([A-Za-z]+)", s)
+        sev_like = bool(lead) and (lead.group(1).upper() in KNOWN_SEVERITIES or lead.group(1).isupper())
+        if is_bullet or sev_like:
+            findings.append({"severity": None, "type": None, "status": "unparseable", "raw": s})
     return findings
 
 
-def weight_of(severity, type_, cfg=DEFAULT_CONFIG):
-    w = cfg["weights"]
-    if severity in ("CRITICAL", "WARNING"):
-        return w.get(severity, 0)
-    if severity == "SUGGESTION":
-        if type_:
-            return w.get(f"SUGGESTION/{type_}", cfg["default_suggestion_weight"])
-        return cfg["default_suggestion_weight"]
+def weight_of(finding, cfg=DEFAULT_CONFIG):
+    st = finding.get("status", "ok")
+    if st in ("unknown_severity", "unparseable"):
+        return cfg["escalate_min"]            # never 0 — force attention
+    sev, typ = finding.get("severity"), finding.get("type")
+    if sev in ("CRITICAL", "WARNING"):
+        return cfg["weights"].get(sev, 0)
+    if sev == "SUGGESTION":
+        if st == "unknown_type":
+            return cfg["unknown_type_weight"]
+        return cfg["weights"].get(f"SUGGESTION/{typ}", cfg["unknown_type_weight"])
     return 0
 
 
+def needs_human(findings):
+    """True if any finding's tag could not be judged by the table."""
+    return any(f.get("status") in ("unknown_severity", "unparseable") for f in findings)
+
+
 def score_review(findings, cfg=DEFAULT_CONFIG):
-    return sum(weight_of(sev, typ, cfg) for sev, typ in findings)
+    return sum(weight_of(f, cfg) for f in findings)
 
 
-def decide_stop(score, verdict, prev_consecutive_low, cfg=DEFAULT_CONFIG):
-    """Return (stop: bool, consecutive_low: int).
-
-    A review is "low" when its score <= stop_cutoff AND the verdict is APPROVE.
-    Stop once that has held for stop_consecutive reviews in a row.
-    """
-    low = (score <= cfg["stop_cutoff"]) and (verdict == "APPROVE")
+def decide_stop(score, verdict, prev_consecutive_low, needs_human_flag=False, cfg=DEFAULT_CONFIG):
+    """Return (stop, consecutive_low). A round is 'low' only when score <=
+    stop_cutoff, verdict is APPROVE, and nothing needs a human."""
+    low = (score <= cfg["stop_cutoff"]) and (verdict == "APPROVE") and not needs_human_flag
     consecutive = prev_consecutive_low + 1 if low else 0
     stop = consecutive >= cfg["stop_consecutive"]
     return stop, consecutive
 
 
+def decide_convergence(score, verdict, escalated, prev_low, prev_no_esc, cfg=DEFAULT_CONFIG):
+    """Dual stopping rule. Converge if EITHER:
+      (a) score <= stop_cutoff and verdict APPROVE, for stop_consecutive rounds, OR
+      (b) no escalate-level finding, for stop_no_escalate_consecutive rounds.
+
+    `escalated` = this round raised a CRITICAL/WARNING/needs-human finding.
+    Returns (stop, low_streak, no_escalate_streak, reason).
+    """
+    low = (score <= cfg["stop_cutoff"]) and (verdict == "APPROVE")
+    low_streak = prev_low + 1 if low else 0
+    no_esc_streak = prev_no_esc + 1 if not escalated else 0
+    if low_streak >= cfg["stop_consecutive"]:
+        return True, low_streak, no_esc_streak, "low_score"
+    if no_esc_streak >= cfg.get("stop_no_escalate_consecutive", 3):
+        return True, low_streak, no_esc_streak, "no_escalate"
+    return False, low_streak, no_esc_streak, ""
+
+
 def classify(findings, cfg=DEFAULT_CONFIG):
-    """Split findings into (escalate_to_human, apply_automatically) by weight."""
+    """Split into (escalate_to_human, apply_automatically) by weight."""
     escalate, apply_ = [], []
-    for sev, typ in findings:
-        target = escalate if weight_of(sev, typ, cfg) >= cfg["escalate_min"] else apply_
-        target.append((sev, typ))
+    for f in findings:
+        (escalate if weight_of(f, cfg) >= cfg["escalate_min"] else apply_).append(f)
     return escalate, apply_
+
+
+def tag_str(finding):
+    """Human-readable tag, e.g. 'SUGGESTION/test' or 'UNPARSEABLE'."""
+    st = finding.get("status")
+    if st == "unparseable":
+        return "UNPARSEABLE"
+    if st == "unknown_severity":
+        return f"UNKNOWN_SEV:{finding.get('severity')}"
+    sev = finding.get("severity")
+    typ = finding.get("type")
+    s = sev if sev else "?"
+    if typ:
+        s += f"/{typ}" + ("(unknown)" if st == "unknown_type" else "")
+    return s
