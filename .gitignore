@@ -4,5 +4,6 @@ __pycache__/
 config.json
 .review_state.json
 .review_prompt.txt
+.implementer_prompt.txt
 review-log.md
 *.patch

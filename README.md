@@ -1,94 +1,109 @@
-# llm-review-loop
+# IVE — Implement · Verify · Evolve
 
-A small, reviewer-agnostic harness that runs an **LLM code-review loop with a
-value-scored stopping rule**. It turns "keep asking an LLM to review until it's
-happy" into something that **terminates deterministically** instead of churning
-on ever-more-marginal suggestions.
+A turnkey **autonomous dev loop** for LLM coding agents. Give it a task and it
+drives an implementer LLM and a reviewer LLM around a closed loop until the work
+**converges** — and stops cleanly instead of churning forever on ever-more-trivial
+review nits.
 
-The core problem it solves: when you ask an LLM to "review strictly," it will
-almost always surface *one more* low-value suggestion every round — so a naive
-review loop never ends. This tool scores each round by the *value* of its
-findings and stops once the findings are consistently trivial.
+```
+        ┌─────────────────────────────────────────────────────┐
+        ▼                                                       │
+   Implement  ──►  Verify  ──►  Evolve  ──►  converged? ──┐     │
+   (LLM A edits     (tests +     (apply fixes /            │ no  │
+    the repo)        scored       feed failures back)      └─────┘
+                     review                          yes ──►  DONE
+                     LLM B)                  high-severity ─►  HUMAN
+```
 
-## How it works
+- **I — Implement:** an agentic implementer LLM (LLM A) edits the target repo to
+  satisfy the task (and, later, to fix failing tests or apply review suggestions).
+- **V — Verify:** run the project's test command, then run one *scored* review
+  round with a reviewer LLM (LLM B).
+- **E — Evolve:** feed test failures / applicable suggestions back to the
+  implementer and iterate — until the review loop **converges**, a
+  human-intervention finding is raised, or `max_iterations` is hit.
 
-1. **Shared tagging convention.** Every review prompt injects a legend telling
-   the reviewer to tag each finding as `[SEVERITY/TYPE]`. Because the convention
-   lives in the prompt, **any reviewer LLM** (via any CLI) emits the same
-   machine-scoreable format — no per-finding re-judging needed.
+## Why a *scored* loop
 
-   ```
-   SEVERITY: CRITICAL | WARNING | SUGGESTION
-   TYPE:     correctness | test | docs | consistency | style
-   - [SUGGESTION/test] Add a regression test for the empty-input path.
-   ```
+When you ask an LLM to "review strictly," it almost always finds *one more*
+low-value suggestion every round, so a naive loop never terminates. IVE makes the
+reviewer tag every finding `[SEVERITY/TYPE]`, assigns each tag a fixed value, and
+**stops once findings are consistently low-value**:
 
-2. **Value index.** Each tag maps to a fixed weight (configurable):
+| tag | weight | meaning |
+|---|---|---|
+| `CRITICAL` | 100 | blocks — always act |
+| `WARNING` | 40 | should fix — **escalate to a human** |
+| `SUGGESTION/correctness` | 15 | claimed-but-untested behaviour / real risk |
+| `SUGGESTION/test` | 10 | missing/weak test for existing behaviour |
+| `SUGGESTION/docs` | 8 | doc ↔ code mismatch |
+| `SUGGESTION/consistency` | 4 | counts, naming, internal mismatch |
+| `SUGGESTION/style` | 1 | subjective polish / nice-to-have |
 
-   | tag | weight | meaning |
-   |---|---|---|
-   | `CRITICAL` | 100 | blocks merge — always act |
-   | `WARNING` | 40 | should fix — escalate to a human |
-   | `SUGGESTION/correctness` | 15 | claimed-but-untested behaviour / real risk |
-   | `SUGGESTION/test` | 10 | missing/weak test for existing behaviour |
-   | `SUGGESTION/docs` | 8 | doc ↔ code mismatch |
-   | `SUGGESTION/consistency` | 4 | counts, naming, internal mismatch |
-   | `SUGGESTION/style` | 1 | subjective polish / nice-to-have / future |
-
-3. **Stopping rule.** A review's score is the sum of its findings' weights. When
-   the score is `<= stop_cutoff` (default 5) for `stop_consecutive` (default 2)
-   `APPROVE` rounds in a row, the loop is **converged → STOP**. Because
-   `CRITICAL`/`WARNING` weigh ≥ the cutoff, blocking work can never trigger an
-   early stop.
-
-4. **Apply / escalate gate.** Findings worth `>= escalate_min` (default 40, i.e.
-   `CRITICAL`/`WARNING`) are surfaced to a human; lighter suggestions are for the
-   driving agent to apply directly.
+A round's score = Σ finding weights. When the score is `<= stop_cutoff` (default
+5) for `stop_consecutive` (default 2) `APPROVE` rounds in a row → **converged**.
+Findings worth `>= escalate_min` (40, i.e. `CRITICAL`/`WARNING`) **halt the loop
+for a human**; lighter suggestions are applied automatically by the implementer.
 
 ## Usage
 
 ```bash
-cp config.example.json config.json   # then edit paths + reviewer_cmd
-python review_loop.py --config config.json
+cp config.example.json config.json     # edit repo_dir, implementer_cmd, test_cmd, reviewer_cmd
+python orchestrate.py --config config.json --task "Implement X with tests"
 ```
 
-Each invocation runs **one round** and prints a `RESULT` block with the verdict,
-score, `CONSECUTIVE_LOW`, and `DECISION: STOP | CONTINUE`. State (the
-consecutive-low counter and per-round history) persists in `state_file` between
-runs, so a driving agent (or a cron/loop) can call it repeatedly and stop when it
-returns `STOP`. Delete the state file to reset the counter.
+Exit codes: `0` converged (done), `3` max_iterations, `4` human escalation,
+`1` reviewer error.
 
-### Plugging in a reviewer
+### Review-only mode
 
-`reviewer_cmd` is any command that reads a prompt and prints the review to
-stdout. The harness writes the full prompt to a file and substitutes
-`{prompt_file}` (the path) or `{prompt_instruction}` (a ready-made "read this
-file and follow it" instruction). Examples:
+To run just the scored review loop (no implementer) against an existing diff:
+
+```bash
+python review_loop.py --config config.json    # one scored round; repeat & stop on DECISION: STOP
+```
+
+### Plugging in the two LLMs
+
+Both commands are configurable and reviewer/implementer can be **different
+models** (independent review is healthier):
 
 ```jsonc
-// Hermes Agent (headless one-shot)
+// implementer (agentic — must edit files in repo_dir)
+"implementer_cmd": ["your-coding-agent", "--prompt-file", "{prompt_file}"],
+// reviewer (reads a prompt, prints the review to stdout)
 "reviewer_cmd": ["hermes", "-z", "{prompt_instruction}"],
 "reviewer_env": { "HERMES_HOME": "/path/to/profile" }
-
-// Any CLI that takes a prompt on argv
-"reviewer_cmd": ["your-llm-cli", "--prompt-file", "{prompt_file}"]
 ```
 
-If `repo_dir` is set and `include_patch` is true, the harness also runs
-`git format-patch -1 HEAD` and adds the patch to the review targets, so the
-reviewer sees the exact diff under review.
+`{prompt_file}` → path to the generated prompt; `{prompt_instruction}` → a ready
+"read this file and follow it" instruction; `{prompt}` (implementer) → the prompt
+text inline.
 
-## Configuration
+## Safety
 
-See `config.example.json`. All paths and the reviewer command live there; the
-code contains no machine-specific paths. The `weights` / `stop_cutoff` /
-`stop_consecutive` / `escalate_min` fields are the only "value judgements" — tune
-them to taste.
+- **The implementer edits files in place and runs unattended.** Run it against a
+  clean git working tree — ideally a throwaway `git worktree` — so every change is
+  diffable and reversible.
+- `max_iterations` is a hard cap; the loop always terminates.
+- `CRITICAL`/`WARNING` findings **stop the loop for a human** — they are never
+  auto-applied.
+- Prefer a **different model** for review than for implementation.
+
+## Layout
+
+| file | role |
+|---|---|
+| `orchestrate.py` | IVE driver (Implement→Verify→Evolve) + pure `decide_next_action` |
+| `review_loop.py` | one scored review round (`run_round`) + standalone CLI |
+| `scoring.py` | pure value index + stop rule + `[SEVERITY/TYPE]` tagging legend |
+| `test_scoring.py`, `test_loop_control.py` | unit tests (no model calls) |
+| `config.example.json` | all machine-specific settings; no paths in code |
 
 ## Tests
 
 ```bash
-python test_scoring.py   # pure logic, no model calls; exit 0 = all pass
+python test_scoring.py && python test_loop_control.py   # exit 0 = all pass
 ```
 
 ## License

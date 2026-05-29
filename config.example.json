@@ -1,17 +1,26 @@
 {
   "repo_dir": "/path/to/your/git/checkout",
-  "include_patch": true,
-  "patch_out_dir": ".",
 
-  "review_targets": [
-    { "label": "PR description", "path": "/path/to/PR-description.md" }
-  ],
-  "pr_context": "One paragraph describing what the change does and what the reviewer should focus on.",
+  "task": "Describe what to implement here, or pass --task / set task_file.",
+  "task_file": null,
+  "max_iterations": 10,
+
+  "implementer_cmd": ["your-agentic-coding-cli", "--prompt-file", "{prompt_file}"],
+  "implementer_env": {},
+  "implementer_timeout": 1800,
+
+  "test_cmd": ["pytest", "-q"],
+  "test_timeout": 1800,
 
   "reviewer_cmd": ["hermes", "-z", "{prompt_instruction}"],
   "reviewer_env": { "HERMES_HOME": "/path/to/reviewer/profile" },
   "reviewer_cwd": null,
   "timeout": 600,
+
+  "include_patch": true,
+  "patch_out_dir": ".",
+  "review_targets": [],
+  "pr_context": "One paragraph describing what the change does and what the reviewer should focus on.",
 
   "weights": {
     "CRITICAL": 100,
@@ -29,5 +38,6 @@
 
   "log_file": "review-log.md",
   "state_file": ".review_state.json",
-  "prompt_file": ".review_prompt.txt"
+  "prompt_file": ".review_prompt.txt",
+  "implementer_prompt_file": ".implementer_prompt.txt"
 }

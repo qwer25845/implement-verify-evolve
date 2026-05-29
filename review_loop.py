@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
-"""Config-driven LLM review loop with a value-scored stopping rule.
+"""Config-driven LLM review round with a value-scored stopping rule.
 
-One invocation = one review round:
-  1. (optional) read the target git repo HEAD and regenerate a patch for it,
-  2. build a review prompt from your PR context + target files + the shared
-     [SEVERITY/TYPE] tagging legend,
-  3. run your configured reviewer command (any LLM CLI that reads a prompt and
-     prints the review to stdout),
-  4. parse + score the findings and decide STOP vs CONTINUE,
-  5. append the raw review to the log (paired with the HEAD sha) and persist the
-     consecutive-low counter to the state file.
-
-Everything machine-specific lives in a JSON config (see config.example.json);
-this file contains no hard-coded paths. Run:
+``run_round(cfg, work_dir)`` performs ONE round and returns a result dict; it is
+imported by the IVE orchestrator (orchestrate.py) and also runnable standalone:
 
     python review_loop.py --config config.json
+
+Everything machine-specific lives in the JSON config (see config.example.json);
+this file contains no hard-coded paths.
 """
 import os
 import re
@@ -45,7 +38,7 @@ def _load_json(path, default):
         return default
 
 
-def _merged_cfg(cfg):
+def merged_cfg(cfg):
     """Fill scoring defaults so a partial config still works."""
     out = dict(scoring.DEFAULT_CONFIG)
     for k in ("weights", "default_suggestion_weight", "stop_cutoff",
@@ -59,11 +52,8 @@ def build_prompt(cfg, head, patch_path):
     targets = list(cfg.get("review_targets", []))
     if patch_path:
         targets.append({"label": f"Patch for commit {head}", "path": patch_path})
-    lines = [
-        cfg.get("pr_context", "Review the following change."),
-        "",
-        "Read ALL of these files before reviewing:",
-    ]
+    lines = [cfg.get("pr_context", "Review the following change."), "",
+             "Read ALL of these files before reviewing:"]
     for i, t in enumerate(targets, 1):
         lines.append(f"{i}. {t.get('label', 'file')}: {t['path']}")
     lines += [
@@ -84,23 +74,13 @@ def build_prompt(cfg, head, patch_path):
     return "\n".join(lines)
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--config", default=os.getenv("REVIEW_CONFIG", "config.json"))
-    args = ap.parse_args()
-
-    cfg = _load_json(args.config, None)
-    if cfg is None:
-        print(f"ERROR: config not found/invalid: {args.config}", file=sys.stderr)
-        return 2
-    score_cfg = _merged_cfg(cfg)
-
-    work_dir = os.path.dirname(os.path.abspath(args.config)) or "."
+def run_round(cfg, work_dir):
+    """Run one review round. Returns a result dict; also writes log + state."""
+    score_cfg = merged_cfg(cfg)
     log_file = os.path.join(work_dir, cfg.get("log_file", "review-log.md"))
     state_file = os.path.join(work_dir, cfg.get("state_file", ".review_state.json"))
     prompt_file = os.path.join(work_dir, cfg.get("prompt_file", ".review_prompt.txt"))
 
-    # 1. HEAD + optional patch
     head, patch_path = "n/a", None
     repo = cfg.get("repo_dir")
     if repo:
@@ -114,22 +94,18 @@ def main():
             patch_path = next((os.path.join(out_dir, f) for f in os.listdir(out_dir)
                                if f.endswith(".patch") and f.startswith("0001-")), None)
 
-    # 2. prompt
     with open(prompt_file, "w", encoding="utf-8") as fh:
         fh.write(build_prompt(cfg, head, patch_path))
 
-    # 3. reviewer command — {prompt_file} / {prompt_instruction} substituted
     instruction = (f"Read the file {prompt_file.replace(os.sep, '/')} and follow "
                    "the instructions inside it exactly.")
     cmd = [a.replace("{prompt_file}", prompt_file.replace(os.sep, "/"))
-            .replace("{prompt_instruction}", instruction)
-           for a in cfg["reviewer_cmd"]]
+            .replace("{prompt_instruction}", instruction) for a in cfg["reviewer_cmd"]]
     env = dict(os.environ)
     env.update(cfg.get("reviewer_env", {}))
     z = _run(cmd, cwd=cfg.get("reviewer_cwd"), env=env, timeout=cfg.get("timeout", 600))
     review = (z.stdout or "").strip()
 
-    # 4. parse + score + decide
     vm = re.search(r"VERDICT:\s*(APPROVE|REQUEST_CHANGES)", review)
     verdict = vm.group(1) if vm else "?"
     findings = scoring.parse_findings(review)
@@ -142,10 +118,8 @@ def main():
     state.setdefault("rounds", []).append({
         "head": head, "verdict": verdict, "score": score,
         "findings": [f"{s}/{t or '-'}" for s, t in findings],
-        "consecutive_low": consecutive, "stop": stop,
-    })
+        "consecutive_low": consecutive, "stop": stop})
 
-    # 5. log + state
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     with open(log_file, "a", encoding="utf-8") as fh:
         fh.write(f"\n\n## Review round - {ts} - HEAD {head} - "
@@ -155,21 +129,39 @@ def main():
     with open(state_file, "w", encoding="utf-8") as fh:
         json.dump(state, fh, indent=2)
 
-    if not review:
-        print("WARN: empty review (reviewer/auth/timeout?) exit=", z.returncode)
-        sys.stderr.write((z.stderr or "")[-1500:])
-        return 1
+    return {
+        "head": head, "verdict": verdict, "score": score, "review": review,
+        "findings": [f"{s}/{t or '-'}" for s, t in findings],
+        "escalate": [f"{s}/{t or '-'}" for s, t in escalate],
+        "apply": [f"{s}/{t or '-'}" for s, t in apply_],
+        "stop": stop, "consecutive_low": consecutive,
+        "ok": bool(review), "stderr": (z.stderr or "")[-1500:],
+    }
 
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--config", default=os.getenv("REVIEW_CONFIG", "config.json"))
+    args = ap.parse_args()
+    cfg = _load_json(args.config, None)
+    if cfg is None:
+        print(f"ERROR: config not found/invalid: {args.config}", file=sys.stderr)
+        return 2
+    work_dir = os.path.dirname(os.path.abspath(args.config)) or "."
+    r = run_round(cfg, work_dir)
+    if not r["ok"]:
+        print("WARN: empty review (reviewer/auth/timeout?)")
+        sys.stderr.write(r["stderr"])
+        return 1
     print("=== RESULT ===")
-    print("HEAD:", head)
-    print("VERDICT:", verdict)
-    print("FINDINGS:", [f"{s}/{t or '-'}" for s, t in findings] or "none")
-    print("SCORE:", score, "(cutoff", score_cfg["stop_cutoff"], ")")
-    print("CONSECUTIVE_LOW:", consecutive, "/", score_cfg["stop_consecutive"])
-    print("DECISION:", "STOP - converged" if stop else "CONTINUE")
-    print("ESCALATE_TO_HUMAN:", [f"{s}/{t or '-'}" for s, t in escalate] or "none")
-    print("APPLY_AUTOMATICALLY:", [f"{s}/{t or '-'}" for s, t in apply_] or "none")
-    print("LOG:", log_file)
+    print("HEAD:", r["head"])
+    print("VERDICT:", r["verdict"])
+    print("FINDINGS:", r["findings"] or "none")
+    print("SCORE:", r["score"])
+    print("CONSECUTIVE_LOW:", r["consecutive_low"])
+    print("DECISION:", "STOP - converged" if r["stop"] else "CONTINUE")
+    print("ESCALATE_TO_HUMAN:", r["escalate"] or "none")
+    print("APPLY_AUTOMATICALLY:", r["apply"] or "none")
     return 0
 
 
