@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# local config + per-run artifacts (keep config.example.json under version control)
+config.json
+.review_state.json
+.review_prompt.txt
+review-log.md
+*.patch

@@ -1,0 +1,33 @@
+{
+  "repo_dir": "/path/to/your/git/checkout",
+  "include_patch": true,
+  "patch_out_dir": ".",
+
+  "review_targets": [
+    { "label": "PR description", "path": "/path/to/PR-description.md" }
+  ],
+  "pr_context": "One paragraph describing what the change does and what the reviewer should focus on.",
+
+  "reviewer_cmd": ["hermes", "-z", "{prompt_instruction}"],
+  "reviewer_env": { "HERMES_HOME": "/path/to/reviewer/profile" },
+  "reviewer_cwd": null,
+  "timeout": 600,
+
+  "weights": {
+    "CRITICAL": 100,
+    "WARNING": 40,
+    "SUGGESTION/correctness": 15,
+    "SUGGESTION/test": 10,
+    "SUGGESTION/docs": 8,
+    "SUGGESTION/consistency": 4,
+    "SUGGESTION/style": 1
+  },
+  "default_suggestion_weight": 4,
+  "stop_cutoff": 5,
+  "stop_consecutive": 2,
+  "escalate_min": 40,
+
+  "log_file": "review-log.md",
+  "state_file": ".review_state.json",
+  "prompt_file": ".review_prompt.txt"
+}
