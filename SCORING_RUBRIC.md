@@ -152,6 +152,14 @@ either): (a) aggregate score ≤ `stop_cutoff` and verdict APPROVE for
 `stop_no_escalate_consecutive` rounds. Many small findings can keep the loop
 alive even when none needs a human.
 
+**Path (b) is independent of the verdict.** A round whose only findings are
+non-escalating suggestions advances path (b) even when its score exceeds
+`stop_cutoff` and the reviewer therefore (correctly, per the Verdict rule) returns
+`REQUEST_CHANGES`. Only path (a) requires `APPROVE`. So the Verdict rule
+("`REQUEST_CHANGES` when score > `stop_cutoff`") and the no-escalate convergence
+path do not conflict: the reviewer always judges the verdict by the rule, and
+convergence reads escalation, not the verdict, on path (b).
+
 Missing/unknown-type suggestions are first re-classified (exception #2): they
 either resolve to a documented type (scored normally) or become
 `reclassify_failed` and escalate. Only escalating/`needs_human` findings (unknown

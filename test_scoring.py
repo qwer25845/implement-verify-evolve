@@ -156,9 +156,11 @@ check("needs_human blocks stop", s.decide_stop(0, "APPROVE", 1, True), (False, 0
 # (a) low-score path
 check("dual low #1", s.decide_convergence(4, "APPROVE", False, 0, 0), (False, 1, 1, ""))
 check("dual low #2 -> stop", s.decide_convergence(4, "APPROVE", False, 1, 1), (True, 2, 2, "low_score"))
-# (b) no-escalate path: findings present but none escalating (e.g. SUGGESTION/test=10, score>cutoff)
-check("no-esc #2 not yet", s.decide_convergence(10, "APPROVE", False, 0, 1), (False, 0, 2, ""))
-check("no-esc #3 -> stop", s.decide_convergence(10, "APPROVE", False, 0, 2), (True, 0, 3, "no_escalate"))
+# (b) no-escalate path: findings present but none escalating (e.g. SUGGESTION/test=10,
+# score>cutoff). Independent of the verdict -> a correct REQUEST_CHANGES (score>cutoff
+# per the Verdict rule) still advances path (b); only path (a) requires APPROVE.
+check("no-esc #2 not yet", s.decide_convergence(10, "REQUEST_CHANGES", False, 0, 1), (False, 0, 2, ""))
+check("no-esc #3 -> stop", s.decide_convergence(10, "REQUEST_CHANGES", False, 0, 2), (True, 0, 3, "no_escalate"))
 # escalate resets the no-escalate streak (and low streak)
 check("escalate resets", s.decide_convergence(40, "REQUEST_CHANGES", True, 1, 2), (False, 0, 0, ""))
 
