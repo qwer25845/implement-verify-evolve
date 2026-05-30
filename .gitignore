@@ -14,3 +14,4 @@ review-log.md
 .calibration_state.json
 .calibration_prompt.txt
 *.patch
+.omc/
