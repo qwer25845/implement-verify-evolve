@@ -92,9 +92,12 @@ The table is fail-safe: **ambiguity escalates, it never silently scores 0.**
    is flagged `needs_human` — an unrecognised severity is treated as at least
    human-review-worthy.
 2. **Missing or unknown TYPE** on a `SUGGESTION` (`[SUGGESTION]` with no type, or
-   e.g. `SUGGESTION/perf`): TYPE is mandatory, so this is scored conservatively at
-   `unknown_type_weight` (= `correctness`/15, never `style`/1) and flagged — never
-   the low default, so it cannot quietly count as "low" and allow convergence.
+   e.g. `SUGGESTION/perf`): TYPE is mandatory, so the finding gets **one more
+   precise re-classification pass** (the reviewer is asked to map it to exactly
+   one documented type). If that succeeds the finding takes the documented type
+   and is scored normally; if it still cannot be classified it becomes
+   `reclassify_failed` → **escalates** (needs human). It is never silently scored
+   low.
 3. **Malformed / unparseable finding-like line** (`*`/numbered bullet, a
    `[SEVERITY/TYPE]` buried in prose, missing brackets): collected as
    `UNPARSEABLE`. Any UNPARSEABLE line flags the round `needs_human` (the
@@ -123,9 +126,23 @@ either): (a) aggregate score ≤ `stop_cutoff` and verdict APPROVE for
 `stop_no_escalate_consecutive` rounds. Many small findings can keep the loop
 alive even when none needs a human.
 
-Missing/unknown-type suggestions are **non-escalating**: their conservative
-weight (15) blocks criterion (a) (it exceeds `stop_cutoff`), but — like any
-non-escalating suggestion — they do not block criterion (b). Recurring,
-non-escalating findings therefore converge via (b) by design; only
-`needs_human` flags (unknown severity, malformed line, verdict contradiction)
-reset the no-escalate streak.
+Missing/unknown-type suggestions are first re-classified (exception #2): they
+either resolve to a documented type (scored normally) or become
+`reclassify_failed` and escalate. Only escalating/`needs_human` findings (unknown
+severity, malformed line, verdict contradiction, reclassify-failure) reset the
+no-escalate streak; ordinary low-value suggestions converge via criterion (b) by
+design.
+
+## Roadmap — auto-fixable severities (planned)
+
+Today every `CRITICAL`/`WARNING` escalates to a human. A future revision will,
+once enough labelled data exists, split high-severity findings by whether the fix
+intent is unambiguous enough to auto-fix:
+
+- *Functionally critical but mechanically obvious* — e.g. a core feature is broken
+  only because two function calls were reordered; the intended behaviour is clear,
+  so it can be auto-fixed rather than escalated.
+- *Critical and judgement-laden* — data/security/design trade-offs — still escalate.
+
+This will likely add an `auto_fixable` axis (or a `MAJOR` tier) so the loop can
+self-repair obvious high-severity breakage while still escalating the rest.

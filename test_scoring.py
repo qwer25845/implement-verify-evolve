@@ -64,6 +64,23 @@ check("nh false (ok only)", s.needs_human(s.parse_findings("- [SUGGESTION/test] 
 check("nh true (unknown sev)", s.needs_human(s.parse_findings("- [BLOCKER/x] a")), True)
 check("nh true (unparseable)", s.needs_human(s.parse_findings("* [WARNING/x] a")), True)
 
+# ── reclassify: unknown_type gets ONE more pass, else escalates ─────────
+def _stub(answer):
+    return lambda _text: answer
+
+uf = s.parse_findings("- [SUGGESTION/perf] slow nested loop")  # -> unknown_type
+check("reclassify success -> ok/type",
+      [(f["status"], f["type"]) for f in s.reclassify(uf, _stub("reliability"))],
+      [("ok", "reliability")])
+check("reclassify unclassifiable -> failed",
+      [f["status"] for f in s.reclassify(uf, _stub("UNCLASSIFIABLE"))], ["reclassify_failed"])
+check("reclassify still-unknown -> failed",
+      [f["status"] for f in s.reclassify(uf, _stub("perf"))], ["reclassify_failed"])
+check("reclassify leaves ok findings",
+      [f["status"] for f in s.reclassify(s.parse_findings("- [SUGGESTION/test] a"), _stub("docs"))], ["ok"])
+check("reclassify_failed weight escalates", w(None, None, "reclassify_failed"), CFG["escalate_min"])
+check("reclassify_failed needs_human", s.needs_human([{"status": "reclassify_failed"}]), True)
+
 # ── stop rule (incl. needs_human gate) ────────────────────────────────
 check("low #1", s.decide_stop(4, "APPROVE", 0, False), (False, 1))
 check("low #2 -> stop", s.decide_stop(4, "APPROVE", 1, False), (True, 2))

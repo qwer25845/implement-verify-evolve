@@ -49,8 +49,8 @@ FINDINGS_LEGEND = (
     "Verdict: REQUEST_CHANGES if any CRITICAL/WARNING or it must be fixed before "
     "merge; APPROVE only if no findings or only low-value optional suggestions.\n"
     "Use EXACTLY this format. A malformed line or an unknown SEVERITY is treated "
-    "as needing human review; an unknown TYPE is scored conservatively. Neither "
-    "is ever ignored.\n"
+    "as needing human review; an unknown/missing TYPE is re-classified once and "
+    "then escalated if it still cannot be mapped. Neither is ever ignored.\n"
     "Example: - [SUGGESTION/test] Add a regression test for the empty-input path."
 )
 
@@ -74,13 +74,15 @@ def parse_findings(text):
         if m:
             sev = m.group(1).upper()
             typ = (m.group(2) or "").lower() or None
+            desc = s[m.end():].strip()
             if sev not in KNOWN_SEVERITIES:
-                findings.append({"severity": sev, "type": typ, "status": "unknown_severity"})
+                st = "unknown_severity"
             elif sev == "SUGGESTION" and (typ is None or typ not in DOCUMENTED_TYPES):
-                # TYPE is mandatory; missing or undocumented -> conservative, flagged.
-                findings.append({"severity": sev, "type": typ, "status": "unknown_type"})
+                # TYPE is mandatory; missing/undocumented -> re-classify once, else escalate.
+                st = "unknown_type"
             else:
-                findings.append({"severity": sev, "type": typ, "status": "ok"})
+                st = "ok"
+            findings.append({"severity": sev, "type": typ, "status": st, "text": desc})
             continue
         # Not strict. Treat as a malformed finding (never silently drop) when it is
         # either a finding-like bullet without a clean tag (e.g. "- Missing test",
@@ -89,13 +91,33 @@ def parse_findings(text):
         lead = re.search(r"\[\s*([A-Za-z]+)", s)
         sev_like = bool(lead) and (lead.group(1).upper() in KNOWN_SEVERITIES or lead.group(1).isupper())
         if is_bullet or sev_like:
-            findings.append({"severity": None, "type": None, "status": "unparseable", "raw": s})
+            findings.append({"severity": None, "type": None, "status": "unparseable", "text": s})
     return findings
+
+
+def reclassify(findings, classifier, cfg=DEFAULT_CONFIG):
+    """Give every ``unknown_type`` finding ONE more precise classification pass.
+
+    ``classifier(text)`` should return a documented TYPE or None. On success the
+    finding is rewritten to ``ok`` with that type; if it still cannot be
+    classified it becomes ``reclassify_failed`` (which escalates to a human).
+    """
+    out = []
+    for f in findings:
+        if f.get("status") != "unknown_type":
+            out.append(f)
+            continue
+        t = (classifier(f.get("text", "")) or "").strip().lower()
+        if t in DOCUMENTED_TYPES:
+            out.append({**f, "type": t, "status": "ok", "reclassified": True})
+        else:
+            out.append({**f, "status": "reclassify_failed"})
+    return out
 
 
 def weight_of(finding, cfg=DEFAULT_CONFIG):
     st = finding.get("status", "ok")
-    if st in ("unknown_severity", "unparseable"):
+    if st in ("unknown_severity", "unparseable", "reclassify_failed"):
         return cfg["escalate_min"]            # never 0 — force attention
     sev, typ = finding.get("severity"), finding.get("type")
     if sev in ("CRITICAL", "WARNING"):
@@ -108,8 +130,10 @@ def weight_of(finding, cfg=DEFAULT_CONFIG):
 
 
 def needs_human(findings):
-    """True if any finding's tag could not be judged by the table."""
-    return any(f.get("status") in ("unknown_severity", "unparseable") for f in findings)
+    """True if any finding could not be judged by the table (incl. an
+    unknown_type that failed re-classification)."""
+    return any(f.get("status") in ("unknown_severity", "unparseable", "reclassify_failed")
+               for f in findings)
 
 
 def score_review(findings, cfg=DEFAULT_CONFIG):
@@ -156,6 +180,8 @@ def tag_str(finding):
     st = finding.get("status")
     if st == "unparseable":
         return "UNPARSEABLE"
+    if st == "reclassify_failed":
+        return "RECLASSIFY_FAILED"
     if st == "unknown_severity":
         return f"UNKNOWN_SEV:{finding.get('severity')}"
     sev = finding.get("severity")
