@@ -83,6 +83,28 @@ purpose: in an autonomous loop they must never collapse into `style`/`consistenc
 | Tests fail on the current diff | `CRITICAL/test` |
 | Off-by-one that drops the last element (reviewer shows the case) | `WARNING/correctness` |
 
+## Multi-category findings (one error spanning two types)
+
+Sometimes one finding does not fit *exactly* one type — it can reasonably be
+judged as both A and B. When the reviewer proposes this **and the author agrees**,
+score it by whether the two categories are disjoint or overlapping:
+
+- **Disjoint** (no intersection — two genuinely separate problems described
+  together): tag `[SEVERITY/A+B]` → **both scores are added** (`weight(A) +
+  weight(B)`). Example: a block that both leaks a secret *and* has no test →
+  `[SUGGESTION/security+test]` = 25 + 10 = 35.
+- **Overlapping** (one underlying problem seen through two lenses): tag
+  `[SEVERITY/A|B]` → **only the larger score counts** (`max(weight(A),
+  weight(B))`), so the same issue is never double-counted. Example: a missing
+  timeout that is both a reliability and a correctness concern →
+  `[SUGGESTION/reliability|correctness]` = max(15, 15) = 15.
+
+This applies on the primary tag and on the re-classification pass. The author
+(orchestrator) only honours a multi-type tag when every listed type is
+documented; otherwise it is treated as unclassifiable and escalates. An ambiguous
+multi-spec with no `+` defaults to `|` (max) so it can never silently inflate the
+score.
+
 ## Exception handling (cases the table CANNOT judge)
 
 The table is fail-safe: **ambiguity escalates, it never silently scores 0.**

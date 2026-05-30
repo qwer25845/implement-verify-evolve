@@ -46,6 +46,9 @@ FINDINGS_LEGEND = (
     "TYPE: security | compatibility | reliability | correctness | test | docs | "
     "maintainability | consistency | style. Use the most specific domain "
     "(security/compatibility/reliability before correctness).\n"
+    "A finding that genuinely spans two categories may be tagged [SEVERITY/A+B] "
+    "(two SEPARATE problems -> both score) or [SEVERITY/A|B] (ONE problem fitting "
+    "two categories -> only the larger scores).\n"
     "Verdict: REQUEST_CHANGES if any CRITICAL/WARNING or it must be fixed before "
     "merge; APPROVE only if no findings or only low-value optional suggestions.\n"
     "Use EXACTLY this format. A malformed line or an unknown SEVERITY is treated "
@@ -54,7 +57,27 @@ FINDINGS_LEGEND = (
     "Example: - [SUGGESTION/test] Add a regression test for the empty-input path."
 )
 
-_STRICT = re.compile(r"^-\s*\[\s*([A-Za-z]+)\s*(?:/\s*([A-Za-z]+)\s*)?\]")
+_STRICT = re.compile(r"^-\s*\[\s*([A-Za-z]+)\s*(?:/\s*([A-Za-z+|]+)\s*)?\]")
+
+
+def parse_type_spec(spec):
+    """Parse a TYPE spec into (types, relation).
+
+    'security'              -> (['security'], 'single')
+    'security+test'         -> (['security','test'], 'sum')   # two separate problems
+    'reliability|correctness' -> (['reliability','correctness'], 'max')  # one problem, two lenses
+    An ambiguous multi-spec with no '+' defaults to 'max' (never double-counts).
+    """
+    spec = (spec or "").strip().lower()
+    if not spec:
+        return [], "single"
+    if "+" in spec:
+        parts = [p.strip() for p in spec.split("+") if p.strip()]
+        return parts, ("sum" if len(parts) > 1 else "single")
+    if "|" in spec:
+        parts = [p.strip() for p in spec.split("|") if p.strip()]
+        return parts, ("max" if len(parts) > 1 else "single")
+    return [spec], "single"
 
 
 def parse_findings(text):
@@ -73,16 +96,23 @@ def parse_findings(text):
         m = _STRICT.match(s)
         if m:
             sev = m.group(1).upper()
-            typ = (m.group(2) or "").lower() or None
+            typ_raw = (m.group(2) or "").strip().lower() or None
             desc = s[m.end():].strip()
             if sev not in KNOWN_SEVERITIES:
-                st = "unknown_severity"
-            elif sev == "SUGGESTION" and (typ is None or typ not in DOCUMENTED_TYPES):
-                # TYPE is mandatory; missing/undocumented -> re-classify once, else escalate.
-                st = "unknown_type"
-            else:
-                st = "ok"
-            findings.append({"severity": sev, "type": typ, "status": st, "text": desc})
+                findings.append({"severity": sev, "type": typ_raw, "status": "unknown_severity", "text": desc})
+            elif sev == "SUGGESTION":
+                types, rel = parse_type_spec(typ_raw)
+                if types and all(t in DOCUMENTED_TYPES for t in types):
+                    f = {"severity": sev, "status": "ok", "text": desc}
+                    if len(types) == 1:
+                        f["type"] = types[0]
+                    else:  # multi-type: + = sum (disjoint), | = max (overlap)
+                        f["type"], f["types"], f["relation"] = None, types, rel
+                    findings.append(f)
+                else:  # missing or some undocumented type -> re-classify once, else escalate
+                    findings.append({"severity": sev, "type": typ_raw, "status": "unknown_type", "text": desc})
+            else:  # CRITICAL / WARNING use the fixed severity weight regardless of type
+                findings.append({"severity": sev, "type": typ_raw, "status": "ok", "text": desc})
             continue
         # Not strict. Treat as a malformed finding (never silently drop) when it is
         # either a finding-like bullet without a clean tag (e.g. "- Missing test",
@@ -107,9 +137,16 @@ def reclassify(findings, classifier, cfg=DEFAULT_CONFIG):
         if f.get("status") != "unknown_type":
             out.append(f)
             continue
-        t = (classifier(f.get("text", "")) or "").strip().lower()
-        if t in DOCUMENTED_TYPES:
-            out.append({**f, "type": t, "status": "ok", "reclassified": True})
+        types, rel = parse_type_spec(classifier(f.get("text", "")))
+        if types and all(t in DOCUMENTED_TYPES for t in types):
+            g = {**f, "status": "ok", "reclassified": True}
+            g.pop("types", None)
+            g.pop("relation", None)
+            if len(types) == 1:
+                g["type"] = types[0]
+            else:
+                g["type"], g["types"], g["relation"] = None, types, rel
+            out.append(g)
         else:
             out.append({**f, "status": "reclassify_failed"})
     return out
@@ -125,6 +162,10 @@ def weight_of(finding, cfg=DEFAULT_CONFIG):
     if sev == "SUGGESTION":
         if st == "unknown_type":
             return cfg["unknown_type_weight"]
+        types = finding.get("types")
+        if types:  # multi-type: sum if disjoint (+), max if overlapping (|)
+            ws = [cfg["weights"].get(f"SUGGESTION/{t}", cfg["unknown_type_weight"]) for t in types]
+            return sum(ws) if finding.get("relation") == "sum" else max(ws)
         return cfg["weights"].get(f"SUGGESTION/{typ}", cfg["unknown_type_weight"])
     return 0
 
@@ -185,6 +226,10 @@ def tag_str(finding):
     if st == "unknown_severity":
         return f"UNKNOWN_SEV:{finding.get('severity')}"
     sev = finding.get("severity")
+    types = finding.get("types")
+    if types:  # multi-type: + = disjoint/sum, | = overlap/max
+        conn = "+" if finding.get("relation") == "sum" else "|"
+        return f"{sev or '?'}/{conn.join(types)}"
     typ = finding.get("type")
     s = sev if sev else "?"
     if typ:

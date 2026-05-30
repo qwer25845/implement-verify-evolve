@@ -81,6 +81,31 @@ check("reclassify leaves ok findings",
 check("reclassify_failed weight escalates", w(None, None, "reclassify_failed"), CFG["escalate_min"])
 check("reclassify_failed needs_human", s.needs_human([{"status": "reclassify_failed"}]), True)
 
+# ── multi-category: A+B (disjoint -> sum), A|B (overlap -> max) ─────────
+check("parse_type_spec single", s.parse_type_spec("security"), (["security"], "single"))
+check("parse_type_spec sum", s.parse_type_spec("security+test"), (["security", "test"], "sum"))
+check("parse_type_spec max", s.parse_type_spec("reliability|correctness"), (["reliability", "correctness"], "max"))
+
+def first(text):
+    return s.parse_findings(text)[0]
+
+fd = first("- [SUGGESTION/security+test] leaks a key and has no test")
+check("multi sum parsed", (fd["types"], fd["relation"], fd["status"]), (["security", "test"], "sum", "ok"))
+check("multi sum weight", s.weight_of(fd), 25 + 10)
+fo = first("- [SUGGESTION/reliability|correctness] missing timeout")
+check("multi max parsed", (fo["types"], fo["relation"]), (["reliability", "correctness"], "max"))
+check("multi max weight", s.weight_of(fo), 15)
+check("multi max weight (uneven)", s.weight_of(first("- [SUGGESTION/security|test] x")), 25)
+check("multi tag_str sum", s.tag_str(fd), "SUGGESTION/security+test")
+check("multi tag_str max", s.tag_str(fo), "SUGGESTION/reliability|correctness")
+
+# reclassify can return a multi-spec; all parts must be documented
+check("reclassify -> multi sum",
+      [(g.get("types"), g.get("relation"), g["status"]) for g in s.reclassify(uf, _stub("reliability+test"))],
+      [(["reliability", "test"], "sum", "ok")])
+check("reclassify multi with undocumented -> failed",
+      [g["status"] for g in s.reclassify(uf, _stub("reliability+perf"))], ["reclassify_failed"])
+
 # ── stop rule (incl. needs_human gate) ────────────────────────────────
 check("low #1", s.decide_stop(4, "APPROVE", 0, False), (False, 1))
 check("low #2 -> stop", s.decide_stop(4, "APPROVE", 1, False), (True, 2))

@@ -58,9 +58,14 @@ def _reclassify_call(text, cfg, work_dir):
     """Ask the reviewer to map ONE finding to a single documented TYPE (a more
     precise second pass). Returns a lowercase type word, or None if it cannot."""
     types = ", ".join(scoring.DOCUMENTED_TYPES)
-    prompt = ("Classify this single code-review finding into EXACTLY ONE type from "
-              f"this list: {types}. If none fits, reply UNCLASSIFIABLE. Reply with "
-              "ONLY the one lowercase word.\n\nFinding: " + (text or ""))
+    prompt = (
+        f"Classify this single code-review finding using ONLY these types: {types}.\n"
+        "Reply with ONLY one of:\n"
+        "  TYPE          (one problem, one category)\n"
+        "  TYPE1+TYPE2   (TWO separate problems -> both count)\n"
+        "  TYPE1|TYPE2   (ONE problem fitting two categories -> the larger counts)\n"
+        "  UNCLASSIFIABLE\n"
+        "No prose.\n\nFinding: " + (text or ""))
     pf = os.path.abspath(os.path.join(work_dir, ".reclassify_prompt.txt"))
     with open(pf, "w", encoding="utf-8") as fh:
         fh.write(prompt)
@@ -71,15 +76,17 @@ def _reclassify_call(text, cfg, work_dir):
     env = dict(os.environ)
     env.update(cfg.get("reviewer_env", {}))
     z = _run(cmd, cwd=cfg.get("reviewer_cwd"), env=env, timeout=cfg.get("timeout", 420))
-    # Robust: find the earliest documented type word anywhere in the reply
-    # (reviewers don't always obey "one word only"). UNCLASSIFIABLE -> None.
+    # Robust: collect documented types by first appearance (reviewers don't always
+    # obey "no prose"); join up to two with the connector they used. None == UNCLASSIFIABLE.
     out = (z.stdout or "").lower()
-    best, pos = None, len(out) + 1
-    for t in scoring.DOCUMENTED_TYPES:
-        m = re.search(r"\b" + re.escape(t) + r"\b", out)
-        if m and m.start() < pos:
-            best, pos = t, m.start()
-    return best
+    hits = sorted((m.start(), t) for t in scoring.DOCUMENTED_TYPES
+                  for m in [re.search(r"\b" + re.escape(t) + r"\b", out)] if m)
+    found = [t for _, t in hits][:2]
+    if not found:
+        return None
+    if len(found) == 1:
+        return found[0]
+    return ("+" if "+" in out else "|").join(found)
 
 
 def parse_verdict(text):
