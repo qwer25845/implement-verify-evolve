@@ -187,6 +187,69 @@ def needs_human(findings):
                for f in findings)
 
 
+# ── Auto-fixable CRITICAL/WARNING (see SCORING_RUBRIC.md) ──────────────────
+AUTOFIX_GATES = ("agreed", "determinate", "local", "sensitive", "semantic", "verifiable")
+
+
+def is_auto_fixable(triage, cfg=DEFAULT_CONFIG):
+    """Decide whether a high-severity finding may be self-repaired instead of
+    escalated, from the two-LLM auto-fix triage answers. Implements the finalized
+    policy: a CRITICAL/WARNING is auto-fixable only when gates A,B,D,E all hold;
+    gate C (verifiable) is MANDATORY for a *semantic* change and WAIVED only for a
+    purely *non-semantic* text fix.
+
+    ``triage`` keys (bool, or None/absent = unknown):
+        agreed       (E) reviewer AND author agree on diagnosis + the obvious fix
+        determinate  (A) exactly one obvious correct change
+        local        (B) small, one site, trivially reversible
+        sensitive    (D) True => touches security/auth/secrets/data/public API
+        verifiable   (C) an objective red->green check exists or can be written
+        semantic         True => changes executable behaviour; False => text-only
+
+    Fail-safe: a gate must be *explicitly* satisfied. A missing/None positive gate
+    (agreed/determinate/local/verifiable) counts as NOT satisfied; a missing/None
+    ``sensitive`` counts as sensitive (block); a missing/None ``semantic`` counts as
+    semantic (so gate C applies). Returns ``(auto_fixable: bool, reason: str)``.
+    """
+    if triage.get("agreed") is not True:
+        return False, "gate_E_no_agreement"
+    if triage.get("determinate") is not True:
+        return False, "gate_A_indeterminate"
+    if triage.get("local") is not True:
+        return False, "gate_B_not_local"
+    if triage.get("sensitive") is not False:          # unknown => treat as sensitive
+        return False, "gate_D_sensitive_surface"
+    semantic = triage.get("semantic")
+    semantic = True if semantic is None else bool(semantic)
+    if semantic:
+        if triage.get("verifiable") is not True:      # gate C mandatory for code
+            return False, "gate_C_unverifiable"
+        return True, "auto_fixable"
+    return True, "auto_fixable_nonsemantic"           # narrow non-semantic text exception
+
+
+def auto_fix_eligible(finding):
+    """Only an OK-status CRITICAL/WARNING can even be considered for auto-fix; a
+    needs-human status (unknown severity/type, unparseable, reclassify-failed)
+    always escalates and is never self-repaired."""
+    return finding.get("status") == "ok" and finding.get("severity") in ("CRITICAL", "WARNING")
+
+
+def is_auto_fixed(finding):
+    """True if this finding is an eligible high-severity finding whose auto-fix
+    triage marked it auto-fixable."""
+    return bool(auto_fix_eligible(finding) and finding.get("autofix", {}).get("auto_fixable"))
+
+
+def has_blocking_activity(findings, cfg=DEFAULT_CONFIG):
+    """True if any finding was high-severity or needs-human this round, **whether
+    or not it was auto-fixed**. Used to reset the no-escalate convergence streak so
+    the loop never declares 'no escalate for N rounds' while it is actively
+    self-repairing high-severity breakage."""
+    return needs_human(findings) or any(
+        weight_of(f, cfg) >= cfg["escalate_min"] for f in findings)
+
+
 def score_review(findings, cfg=DEFAULT_CONFIG):
     return sum(weight_of(f, cfg) for f in findings)
 
@@ -219,10 +282,14 @@ def decide_convergence(score, verdict, escalated, prev_low, prev_no_esc, cfg=DEF
 
 
 def classify(findings, cfg=DEFAULT_CONFIG):
-    """Split into (escalate_to_human, apply_automatically) by weight."""
+    """Split into (escalate_to_human, apply_automatically) by weight, except a
+    high-severity finding whose auto-fix triage passed (``is_auto_fixed``) is
+    routed to *apply* so the loop self-repairs it instead of escalating:
+    escalate ⟺ (weight ≥ escalate_min) AND NOT (auto_fixable AND two-LLM-agreed)."""
     escalate, apply_ = [], []
     for f in findings:
-        (escalate if weight_of(f, cfg) >= cfg["escalate_min"] else apply_).append(f)
+        high = weight_of(f, cfg) >= cfg["escalate_min"]
+        (escalate if (high and not is_auto_fixed(f)) else apply_).append(f)
     return escalate, apply_
 
 
@@ -244,4 +311,6 @@ def tag_str(finding):
     s = sev if sev else "?"
     if typ:
         s += f"/{typ}" + ("(unknown)" if st == "unknown_type" else "")
+    if is_auto_fixed(finding):
+        s += " (auto-fix)"
     return s

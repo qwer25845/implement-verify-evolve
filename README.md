@@ -47,6 +47,41 @@ A round's score = Σ finding weights. When the score is `<= stop_cutoff` (defaul
 Findings worth `>= escalate_min` (40, i.e. `CRITICAL`/`WARNING`) **halt the loop
 for a human**; lighter suggestions are applied automatically by the implementer.
 
+### Auto-fixing high-severity findings
+
+Severity (impact) and *auto-fixability* (how determinate the repair) are
+independent: a `CRITICAL` whose fix is the single obvious change can be repaired
+without a human, while a `WARNING` whose fix is a judgement call cannot. Each
+`CRITICAL`/`WARNING` is run through an **auto-fix triage** and self-repaired
+(routed to the implementer) instead of escalated **only** when all five gates hold:
+
+- **A** determinate fix · **B** local & reversible · **D** no sensitive surface
+  (security/auth/data/public-API) · **E** reviewer **and** author both agree it is
+  the one obvious fix;
+- **C** verifiable — *mandatory* for any change that alters behaviour, *waived*
+  only for a purely non-semantic text fix (comments/docstrings/docs/log copy).
+
+Any gate failing (or any unanswered gate — fail-safe) escalates to a human, as
+does any `needs_human` finding. See `SCORING_RUBRIC.md` → "Auto-fixable
+CRITICAL/WARNING" for the full definition and worked examples.
+
+**Enabling it (opt-out with a safety interlock).** The E-gate is a real two-sided
+check only when a separate `author_cmd` (LLM A) is configured — without one it
+degrades to the reviewer's self-report. So `auto_fix` defaults **on** when an
+`author_cmd` is set and **off** when it is not. An explicit `"auto_fix": true` /
+`false` always wins (use `true` to force reviewer-only auto-fix without an author,
+`false` to disable it even with one). For a genuine check, point `author_cmd` at a
+**different** model than the reviewer:
+
+```jsonc
+"reviewer_cmd": ["hermes", "-z", "{prompt_instruction}"],   // LLM B (reviewer)
+"author_cmd":   ["claude", "-p"]                            // LLM A (author) — a different model
+```
+
+The author prompt is delivered on **stdin** when `author_cmd` has no `{prompt}` /
+`{prompt_file}` / `{prompt_instruction}` placeholder (more robust than passing long
+text as a CLI argument); otherwise the placeholder is substituted into argv.
+
 ## Usage
 
 ```bash
@@ -88,8 +123,11 @@ text inline.
   clean git working tree — ideally a throwaway `git worktree` — so every change is
   diffable and reversible.
 - `max_iterations` is a hard cap; the loop always terminates.
-- `CRITICAL`/`WARNING` findings **stop the loop for a human** — they are never
-  auto-applied.
+- `CRITICAL`/`WARNING` findings **stop the loop for a human** unless `auto_fix` is
+  active (on by default once an `author_cmd` is configured), in which case they are
+  self-repaired *only* when the five auto-fix gates all pass (determinate, local,
+  verifiable, no sensitive surface, two-LLM-agreed); anything ambiguous, sensitive,
+  or unverifiable still escalates. Set `"auto_fix": false` to always stop for a human.
 - Prefer a **different model** for review than for implementation.
 
 ## Layout

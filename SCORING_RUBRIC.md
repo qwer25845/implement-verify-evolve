@@ -158,16 +158,93 @@ severity, malformed line, verdict contradiction, reclassify-failure) reset the
 no-escalate streak; ordinary low-value suggestions converge via criterion (b) by
 design.
 
-## Roadmap — auto-fixable severities (planned)
+## Auto-fixable `CRITICAL`/`WARNING` (self-repair vs. escalate)
 
-Today every `CRITICAL`/`WARNING` escalates to a human. A future revision will,
-once enough labelled data exists, split high-severity findings by whether the fix
-intent is unambiguous enough to auto-fix:
+By default every `CRITICAL`/`WARNING` escalates to a human. But *severity*
+(impact — how bad if left unfixed) and *auto-fixability* (fix-determinacy — how
+unambiguous the repair) are **independent axes**: a `CRITICAL` whose repair is the
+single obvious change is auto-fixable; a `WARNING` whose repair is a judgement call
+is not. When the loop runs with `auto_fix` enabled, a high-severity finding may be
+**self-repaired instead of escalated** — but only when every gate below holds.
 
-- *Functionally critical but mechanically obvious* — e.g. a core feature is broken
-  only because two function calls were reordered; the intended behaviour is clear,
-  so it can be auto-fixed rather than escalated.
-- *Critical and judgement-laden* — data/security/design trade-offs — still escalate.
+### The five gates
 
-This will likely add an `auto_fixable` axis (or a `MAJOR` tier) so the loop can
-self-repair obvious high-severity breakage while still escalating the rest.
+A `CRITICAL`/`WARNING` is **auto-fixable** only if ALL hold:
+
+- **A. Determinate fix** — exactly one obvious correct change; no choice among
+  alternatives, no policy/design/API/data-model decision. (restore call order, add
+  a missing `await`, fix an intended off-by-one, correct a misspelled identifier,
+  re-add an accidentally deleted line.)
+- **B. Local & reversible** — small, one site / few lines, trivially diffable and
+  revertible; not a cross-cutting refactor.
+- **C. Verifiable** — an objective check (an existing failing test → green, or a
+  new test pinning the intended behaviour) can prove the fix red→green.
+  **Gate C is MANDATORY for any *semantic* change** (one that alters executable
+  behaviour) and is **waived only for a purely *non-semantic* text fix** (see the
+  exception below).
+- **D. No sensitive surface** — does not change security posture, secrets, auth,
+  data migration/deletion, or a public API/contract (where "right" is itself a
+  decision).
+- **E. Two-LLM agreement** — reviewer (B) and author (A) both agree on (i) the
+  diagnosis and (ii) that the fix is the single obvious one. (Reuses the handshake
+  from "Two-LLM agreement" above.)
+
+**Any gate fails → escalate to a human.** Fail-safe: a gate the triage leaves
+unanswered counts as *not satisfied* (and an unanswered "sensitive?" counts as
+*sensitive*), so missing information always escalates, never auto-fixes.
+
+### Gate C — the non-semantic exception (why it is mandatory for code)
+
+Gate C is mandatory for any change that alters executable behaviour because an
+"obvious" fix can be a hidden regression: e.g. two LLMs both agree `if x > 0`
+"obviously" should be `if x >= 0`, but applying it turns a *different* existing
+test red. Only an objective red→green check catches that — so semantic changes
+must be verifiable to auto-fix.
+
+The single exception is a **purely non-semantic text fix**, where no objective
+runtime test is meaningful or possible:
+
+- comments, docstrings, Markdown docs, or spelling/grammar in log or UI strings,
+- **no executable logic changed**, and
+- it does not touch a sensitive surface (Gate D still applies — a contractual or
+  safety-critical string is *not* "non-semantic").
+
+Such a fix may auto-apply with Gate C waived. (In practice these are usually better
+re-tagged below `CRITICAL`/`WARNING` in the first place — a log typo is a
+`SUGGESTION`, not a `CRITICAL`.) Everything else that changes behaviour must pass
+Gate C.
+
+### Worked examples (auto-fix triage)
+
+| finding | gates | outcome |
+|---|---|---|
+| Deleted `return` line; an existing test already fails | A,B,C,D,E ✓ | `CRITICAL` → **auto-fix** |
+| Off-by-one drops last element; existing test fails | A,B,C,D,E ✓ | `WARNING` → **auto-fix** |
+| Missing `await`; verifiable with a spy/fake async (no live net) | A,B,C,D,E ✓ | `WARNING` → **auto-fix** |
+| Missing `await` but *no* reliable test can be written | C ✗ | **escalate** |
+| `if x > 0`→`>= 0` looks obvious, but the fix turns another test red | C ✗ (regression) | **escalate** |
+| Log string typo `Conection`→`Connection` (non-semantic, no logic) | C waived | **auto-fix** (prefer re-tag to `SUGGESTION`) |
+| `except ValueError`→`except Exception` "restore" the narrow catch | A ✗ / D (error semantics) | **escalate** |
+| SQL injection fix | D ✗ (security) | **escalate** |
+| Race needing a locking strategy | A ✗ (design choice) | **escalate** |
+| Public-API break | D ✗ (contract) | **escalate** |
+| Vulnerable dependency version bump | B ✗ / D ✗ (broad, security) | **escalate** |
+
+### How it integrates
+
+- High-severity findings carry an `auto_fixable` axis set by an **auto-fix triage**:
+  the reviewer (B) answers gates A–D + *semantic?* + the exact fix, and the author
+  (A) is asked to agree on the diagnosis and that the fix is the obvious one (E).
+- Escalation becomes: **escalate ⟺ (weight ≥ `escalate_min`) AND NOT
+  (auto_fixable AND two-LLM-agreed)**. An auto-fixed high finding is routed to the
+  *apply* lane (the implementer makes the fix) instead of the *escalate* lane.
+- A `needs_human` status (unknown severity/type, unparseable line, reclassify
+  failure, verdict contradiction) is **never** auto-fixable — it always escalates.
+- An auto-fixed high finding still counts as high-severity *activity*, so it resets
+  the no-escalate convergence streak: the loop never declares "converged" while it
+  is actively self-repairing breakage.
+- Auto-fix is **opt-out with a safety interlock** (`config.auto_fix`): unset, it
+  defaults **on** only when an `author_cmd` is configured, because the E-gate is a
+  genuine two-sided check only with a separate author LLM; with no author it
+  degrades to the reviewer's self-report, so it stays off unless explicitly forced.
+  An explicit `true`/`false` always wins.

@@ -17,7 +17,8 @@
   "reviewer_cwd": null,
   "timeout": 600,
 
-  "author_cmd": ["your-author-llm", "--prompt-file", "{prompt_file}"],
+  "author_cmd": ["claude", "-p"],
+  "_author_cmd_help": "LLM A for the auto-fix E-gate; use a DIFFERENT model than the reviewer. No {prompt*} placeholder => the prompt is piped on stdin (robust). Or use {prompt_file}/{prompt_instruction} for a file-reading CLI.",
   "author_env": {},
   "author_cwd": null,
 
@@ -40,6 +41,9 @@
   "stop_consecutive": 2,
   "stop_no_escalate_consecutive": 3,
   "escalate_min": 40,
+
+  "_auto_fix_help": "Self-repair a CRITICAL/WARNING instead of escalating when the 5 gates pass. Defaults ON when author_cmd is set (the E-gate needs a separate author LLM), OFF otherwise. Explicit true/false overrides.",
+  "auto_fix": true,
 
   "log_file": "review-log.md",
   "state_file": ".review_state.json",

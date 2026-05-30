@@ -25,8 +25,8 @@ except Exception:
     pass
 
 
-def _run(cmd, cwd=None, env=None, timeout=600):
-    return subprocess.run(cmd, cwd=cwd, env=env, timeout=timeout,
+def _run(cmd, cwd=None, env=None, timeout=600, input=None):
+    return subprocess.run(cmd, cwd=cwd, env=env, timeout=timeout, input=input,
                           capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
@@ -52,6 +52,16 @@ def merged_cfg(cfg):
         if k in cfg:
             out[k] = cfg[k]
     return out
+
+
+def auto_fix_enabled(cfg):
+    """Opt-out with a safety interlock: auto-fix defaults ON only when an
+    ``author_cmd`` is configured, because the E-gate (two-LLM agreement) is a real
+    two-sided check only with a separate author LLM; without one it would degrade to
+    the reviewer's self-report. An explicit ``cfg["auto_fix"]`` (true/false) always
+    wins. Returns a bool."""
+    af = cfg.get("auto_fix")
+    return bool(cfg.get("author_cmd")) if af is None else bool(af)
 
 
 def _reclassify_call(text, cfg, work_dir):
@@ -89,29 +99,124 @@ def _reclassify_call(text, cfg, work_dir):
     return ("+" if "+" in out else "|").join(found)
 
 
+def _run_author(prompt, cfg, work_dir, prompt_name=".author_prompt.txt"):
+    """Deliver ``prompt`` to the author LLM (LLM A, via author_cmd) and return its
+    raw stdout. Delivery is robust by default: if author_cmd contains NO
+    ``{prompt}`` / ``{prompt_file}`` / ``{prompt_instruction}`` placeholder, the
+    prompt is piped on **stdin** (e.g. ``["claude", "-p"]``), which avoids the
+    arg-length/escaping flakiness of passing long text as a single CLI argument.
+    Otherwise the placeholder is substituted into argv."""
+    placeholders = ("{prompt}", "{prompt_file}", "{prompt_instruction}")
+    use_stdin = not any(ph in a for a in cfg["author_cmd"] for ph in placeholders)
+    pf = os.path.abspath(os.path.join(work_dir, prompt_name))
+    with open(pf, "w", encoding="utf-8") as fh:
+        fh.write(prompt)
+    instruction = (f"Read the file {pf.replace(os.sep, '/')} and follow the "
+                   "instruction inside it exactly.")
+    cmd = [a.replace("{prompt_file}", pf.replace(os.sep, "/"))
+            .replace("{prompt_instruction}", instruction)
+            .replace("{prompt}", prompt)
+           for a in cfg["author_cmd"]]
+    env = dict(os.environ)
+    env.update(cfg.get("author_env", {}))
+    z = _run(cmd, cwd=cfg.get("author_cwd"), env=env, timeout=cfg.get("timeout", 420),
+             input=(prompt if use_stdin else None))
+    return z.stdout or ""
+
+
+def _agree_word(out):
+    """Parse a free AGREE/DISAGREE reply: DISAGREE wins if present, else AGREE."""
+    o = (out or "").upper()
+    if re.search(r"\bDISAGREE\b", o):
+        return False
+    return bool(re.search(r"\bAGREE\b", o))
+
+
 def _author_agrees(text, proposed_tag, cfg, work_dir):
-    """Two-LLM handshake: ask the code author (LLM A, via author_cmd) whether it
-    agrees with the reviewer's classification. Returns True/False. If no
-    author_cmd is configured, honor the proposal (returns True)."""
+    """Two-LLM handshake: ask the code author (LLM A) whether it agrees with the
+    reviewer's classification. Returns True/False. With no author_cmd, honor the
+    proposal (returns True)."""
     if not cfg.get("author_cmd"):
         return True
     prompt = ("You are the AUTHOR of the code under review. A reviewer classified "
               f"this finding as {proposed_tag}. Do you AGREE that classification is "
               "correct? Reply with ONLY: AGREE or DISAGREE.\n\nFinding: " + (text or ""))
-    pf = os.path.abspath(os.path.join(work_dir, ".author_prompt.txt"))
+    return _agree_word(_run_author(prompt, cfg, work_dir))
+
+
+def _author_agrees_fix(text, fix, cfg, work_dir):
+    """E-gate (author side) for auto-fix: have the author (LLM A) INDEPENDENTLY
+    re-rate the proposed fix in the same structured form as the reviewer. Returns
+    True only when the author both agrees the fix may be auto-applied AND does not
+    flag it as non-determinate (a free-form reply was unreliable — structured
+    yes/no parses cleanly). With no author_cmd, honor the reviewer's proposal."""
+    if not cfg.get("author_cmd"):
+        return True
+    prompt = (
+        "You are LLM A, the code author, independently re-rating a reviewer's "
+        "auto-fix proposal. Assume the finding's factual description is accurate. "
+        "Answer EXACTLY these two lines and nothing else:\n"
+        "DETERMINATE: yes/no   (is the PROPOSED FIX one concrete edit any competent "
+        "author writes the same way - restore a deleted line, add a missing `await`, "
+        "fix an off-by-one, correct a typo - as opposed to choosing among approaches "
+        "or a design/policy/API decision such as 'add a locking strategy', refactor, "
+        "pick an algorithm?)\n"
+        "AGREE: yes/no         (do you agree this fix may be applied automatically "
+        "without a human?)\n\n"
+        f"Finding: {text or ''}\nProposed fix: {fix or '(unspecified)'}")
+    out = _run_author(prompt, cfg, work_dir, ".autofix_author_prompt.txt")
+    return _yesno(out, "AGREE") is True and _yesno(out, "DETERMINATE") is not False
+
+
+def _yesno(out, key):
+    """Read a 'KEY: yes/no' line (case-insensitive, line-anchored). Returns
+    True/False, or None if the key is absent (treated as unknown by the gates)."""
+    m = re.search(r"(?mi)^\s*" + re.escape(key) + r"\s*:\s*(yes|no|true|false|y|n)\b", out or "")
+    return None if not m else m.group(1).lower() in ("yes", "true", "y")
+
+
+def _autofix_triage_call(text, cfg, work_dir):
+    """Auto-fix triage for ONE high-severity finding: ask the reviewer the five
+    gate questions in a machine-readable form. Returns a triage dict
+    {diagnosis_agreed, determinate, local, semantic, verifiable, sensitive, fix}
+    (bool/None + a one-line fix), or None on an empty reply."""
+    prompt = (
+        "You are triaging ONE high-severity (CRITICAL/WARNING) code-review finding "
+        "to decide whether it can be auto-fixed safely or must go to a human.\n"
+        "Answer EXACTLY these seven lines and nothing else:\n"
+        "DIAGNOSIS_AGREED: yes/no  (are you confident the finding is real and you know the cause?)\n"
+        "DETERMINATE: yes/no       (is there exactly ONE obvious correct fix, no design/policy/API choice?)\n"
+        "LOCAL: yes/no             (small, one site / few lines, trivially reversible?)\n"
+        "SEMANTIC: yes/no          (does the fix change executable behaviour? answer 'no' ONLY for a pure\n"
+        "                           text fix: comments, docstrings, docs, or log/UI spelling/grammar)\n"
+        "VERIFIABLE: yes/no        (can an objective automated test prove the fix red->green?)\n"
+        "SENSITIVE: yes/no         (does it touch security, secrets, auth, data migration/deletion,\n"
+        "                           or a public API/contract?)\n"
+        "FIX: <one line describing the exact change>\n\n"
+        "Finding: " + (text or ""))
+    pf = os.path.abspath(os.path.join(work_dir, ".autofix_prompt.txt"))
     with open(pf, "w", encoding="utf-8") as fh:
         fh.write(prompt)
     instruction = (f"Read the file {pf.replace(os.sep, '/')} and follow the "
                    "instruction inside it exactly.")
     cmd = [a.replace("{prompt_file}", pf.replace(os.sep, "/")).replace("{prompt_instruction}", instruction)
-           for a in cfg["author_cmd"]]
+           for a in cfg["reviewer_cmd"]]
     env = dict(os.environ)
-    env.update(cfg.get("author_env", {}))
-    z = _run(cmd, cwd=cfg.get("author_cwd"), env=env, timeout=cfg.get("timeout", 420))
-    out = (z.stdout or "").upper()
-    if re.search(r"\bDISAGREE\b", out):
-        return False
-    return bool(re.search(r"\bAGREE\b", out))
+    env.update(cfg.get("reviewer_env", {}))
+    z = _run(cmd, cwd=cfg.get("reviewer_cwd"), env=env, timeout=cfg.get("timeout", 420))
+    out = (z.stdout or "")
+    if not out.strip():
+        return None
+    fix = re.search(r"(?mi)^\s*FIX:\s*(.+)$", out)
+    return {
+        "diagnosis_agreed": _yesno(out, "DIAGNOSIS_AGREED"),
+        "determinate": _yesno(out, "DETERMINATE"),
+        "local": _yesno(out, "LOCAL"),
+        "semantic": _yesno(out, "SEMANTIC"),
+        "verifiable": _yesno(out, "VERIFIABLE"),
+        "sensitive": _yesno(out, "SENSITIVE"),
+        "fix": fix.group(1).strip() if fix else "",
+    }
 
 
 def parse_verdict(text):
@@ -198,15 +303,42 @@ def run_round(cfg, work_dir):
             findings,
             lambda t: _reclassify_call(t, cfg, work_dir),
             lambda t, tag: _author_agrees(t, tag, cfg, work_dir))
+    # Auto-fix triage: a CRITICAL/WARNING may be self-repaired instead of escalated
+    # when the five gates hold. Gate C (verifiable) is mandatory for a semantic
+    # change and waived only for a purely non-semantic text fix. See SCORING_RUBRIC.md
+    # "Auto-fixable CRITICAL/WARNING".
+    #
+    # Opt-OUT default with a safety interlock (see auto_fix_enabled): unset, it
+    # defaults ON only when an author_cmd is configured so the E-gate is a real
+    # two-LLM check; an explicit cfg["auto_fix"] always wins.
+    if auto_fix_enabled(cfg):
+        for f in findings:
+            if not scoring.auto_fix_eligible(f):
+                continue
+            tri = _autofix_triage_call(f.get("text", ""), cfg, work_dir)
+            if not tri:
+                continue                      # no triage -> stays escalated (safe default)
+            # Gate E: reviewer's diagnosis confidence AND the author's agreement
+            # that the proposed fix is the single obvious one.
+            agreed = tri.get("diagnosis_agreed") is True
+            if agreed:
+                agreed = _author_agrees_fix(f.get("text", ""), tri.get("fix", ""), cfg, work_dir)
+            triage = {**tri, "agreed": agreed}
+            ok, why = scoring.is_auto_fixable(triage, score_cfg)
+            f["autofix"] = {"auto_fixable": ok, "reason": why, **triage}
+
     nh = scoring.needs_human(findings) or verdict_anomaly(verdict, findings)
     score = scoring.score_review(findings, score_cfg)
     escalate, apply_ = scoring.classify(findings, score_cfg)
     esc_str = [scoring.tag_str(f) for f in escalate] or (["NEEDS_HUMAN"] if nh else [])
 
-    escalated = bool(esc_str)
+    # Human-escalation drives the loop's hard stop; but high-severity *activity*
+    # (even when auto-fixed) must reset the no-escalate convergence streak so the
+    # loop never converges while it is still self-repairing breakage.
+    blocking = scoring.has_blocking_activity(findings, score_cfg) or nh
     state = _load_json(state_file, {"consecutive_low": 0, "consecutive_no_escalate": 0, "rounds": []})
     stop, low_streak, no_esc_streak, reason = scoring.decide_convergence(
-        score, verdict, escalated,
+        score, verdict, blocking,
         state.get("consecutive_low", 0), state.get("consecutive_no_escalate", 0), score_cfg)
     state["consecutive_low"] = low_streak
     state["consecutive_no_escalate"] = no_esc_streak
@@ -231,6 +363,7 @@ def run_round(cfg, work_dir):
         "findings": [scoring.tag_str(f) for f in findings],
         "escalate": esc_str,
         "apply": [scoring.tag_str(f) for f in apply_],
+        "auto_fixed": [scoring.tag_str(f) for f in apply_ if scoring.is_auto_fixed(f)],
         "stop": stop, "stop_reason": reason, "needs_human": nh,
         "consecutive_low": low_streak, "consecutive_no_escalate": no_esc_streak,
         "ok": bool(review), "stderr": (z.stderr or "")[-1500:],
@@ -261,6 +394,8 @@ def main():
     print("DECISION:", f"STOP - converged ({r['stop_reason']})" if r["stop"] else "CONTINUE")
     print("ESCALATE_TO_HUMAN:", r["escalate"] or "none")
     print("APPLY_AUTOMATICALLY:", r["apply"] or "none")
+    if r.get("auto_fixed"):
+        print("AUTO_FIXED (high-severity self-repair):", r["auto_fixed"])
     return 0
 
 

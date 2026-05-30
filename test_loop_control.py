@@ -31,6 +31,11 @@ check("continue", o.decide_next_action(True, APPROVE_CONTINUE, 2, 10), "continue
 mixed = {"escalate": ["CRITICAL/-"], "stop": True, "apply": ["SUGGESTION/test"]}
 check("escalate beats done", o.decide_next_action(True, mixed, 2, 10), "human_escalate")
 
+# auto-fixed CRITICAL: routed to apply (not escalate) -> the loop self-repairs it
+AUTOFIX = {"escalate": [], "stop": False, "apply": ["CRITICAL (auto-fix)"],
+           "auto_fixed": ["CRITICAL (auto-fix)"]}
+check("auto-fixed critical -> apply", o.decide_next_action(True, AUTOFIX, 2, 10), "apply_suggestions")
+
 # failing tests take priority over the (stale) review of an earlier state
 check("fix_tests beats review", o.decide_next_action(False, APPROVE_DONE, 2, 10), "fix_tests")
 
@@ -48,6 +53,12 @@ check("request_changes + no findings", rl.verdict_anomaly("REQUEST_CHANGES", [])
 check("approve + warning", rl.verdict_anomaly("APPROVE", sc.parse_findings("- [WARNING/x] a")), True)
 check("approve clean ok", rl.verdict_anomaly("APPROVE", sc.parse_findings("- [SUGGESTION/test] a")), False)
 check("request_changes + findings ok", rl.verdict_anomaly("REQUEST_CHANGES", sc.parse_findings("- [WARNING/x] a")), False)
+
+# auto_fix interlock: opt-out (default ON) only when an author_cmd exists; explicit wins
+check("auto_fix off when no author_cmd", rl.auto_fix_enabled({}), False)
+check("auto_fix on by default with author_cmd", rl.auto_fix_enabled({"author_cmd": ["x"]}), True)
+check("auto_fix explicit false wins (with author)", rl.auto_fix_enabled({"author_cmd": ["x"], "auto_fix": False}), False)
+check("auto_fix explicit true wins (no author)", rl.auto_fix_enabled({"auto_fix": True}), True)
 
 # merged_cfg must DEEP-merge weights (partial override keeps CRITICAL/WARNING)
 m = rl.merged_cfg({"weights": {"SUGGESTION/style": 2}})

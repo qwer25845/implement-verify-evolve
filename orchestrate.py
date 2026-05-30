@@ -168,6 +168,8 @@ def main():
             return 3
         if action == "apply_suggestions":
             print(f"[iter {it}] EVOLVE: apply suggestions {review['apply']}")
+            if review.get("auto_fixed"):
+                print(f"  (self-repairing high-severity findings: {review['auto_fixed']})")
             feedback = ("Apply these reviewer suggestions, then keep tests green:\n"
                         + review["review"])
             needs_impl = True

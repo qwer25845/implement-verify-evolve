@@ -136,6 +136,66 @@ check("no-esc #3 -> stop", s.decide_convergence(10, "APPROVE", False, 0, 2), (Tr
 # escalate resets the no-escalate streak (and low streak)
 check("escalate resets", s.decide_convergence(40, "REQUEST_CHANGES", True, 1, 2), (False, 0, 0, ""))
 
+# ── auto-fixable CRITICAL/WARNING (Gate C mandatory for semantic, waived for text) ──
+def tri(**kw):
+    base = {"agreed": True, "determinate": True, "local": True,
+            "sensitive": False, "semantic": True, "verifiable": True}
+    base.update(kw)
+    return base
+
+check("autofix all gates pass", s.is_auto_fixable(tri())[0], True)
+check("autofix all gates reason", s.is_auto_fixable(tri())[1], "auto_fixable")
+check("autofix needs agreement (E)", s.is_auto_fixable(tri(agreed=False))[0], False)
+check("autofix E reason", s.is_auto_fixable(tri(agreed=False))[1], "gate_E_no_agreement")
+check("autofix needs determinate (A)", s.is_auto_fixable(tri(determinate=False))[0], False)
+check("autofix needs local (B)", s.is_auto_fixable(tri(local=False))[0], False)
+check("autofix sensitive blocks (D)", s.is_auto_fixable(tri(sensitive=True))[0], False)
+check("autofix D reason", s.is_auto_fixable(tri(sensitive=True))[1], "gate_D_sensitive_surface")
+# Gate C is MANDATORY for a semantic change
+check("autofix semantic needs verifiable (C)", s.is_auto_fixable(tri(verifiable=False))[0], False)
+check("autofix C reason", s.is_auto_fixable(tri(verifiable=False))[1], "gate_C_unverifiable")
+# ...but WAIVED for a purely non-semantic text fix
+check("autofix nonsemantic waives C", s.is_auto_fixable(tri(semantic=False, verifiable=False))[0], True)
+check("autofix nonsemantic reason", s.is_auto_fixable(tri(semantic=False, verifiable=False))[1], "auto_fixable_nonsemantic")
+# a non-semantic fix on a sensitive surface still blocks (Gate D checked first)
+check("autofix nonsemantic still blocked by D", s.is_auto_fixable(tri(semantic=False, verifiable=False, sensitive=True))[0], False)
+# fail-safe: missing gates never auto-fix
+check("autofix empty triage", s.is_auto_fixable({})[0], False)
+_t = tri(); del _t["sensitive"]
+check("autofix missing sensitive => treated sensitive (block)", s.is_auto_fixable(_t)[0], False)
+_t = tri(); del _t["semantic"]
+check("autofix missing semantic => semantic default (verifiable ok)", s.is_auto_fixable(_t)[0], True)
+_t = tri(verifiable=False); del _t["semantic"]
+check("autofix missing semantic + not verifiable => block", s.is_auto_fixable(_t)[0], False)
+
+def crit(autofix=None, sev="CRITICAL"):
+    f = {"severity": sev, "type": None, "status": "ok", "text": "x"}
+    if autofix is not None:
+        f["autofix"] = autofix
+    return f
+
+check("eligible critical ok", s.auto_fix_eligible(crit()), True)
+check("eligible warning ok", s.auto_fix_eligible(crit(sev="WARNING")), True)
+check("not eligible suggestion", s.auto_fix_eligible({"severity": "SUGGESTION", "status": "ok"}), False)
+check("not eligible unparseable", s.auto_fix_eligible({"status": "unparseable"}), False)
+check("is_auto_fixed true", s.is_auto_fixed(crit({"auto_fixable": True})), True)
+check("is_auto_fixed false flag", s.is_auto_fixed(crit({"auto_fixable": False})), False)
+check("is_auto_fixed needs the flag", s.is_auto_fixed(crit()), False)
+
+# classify: an auto-fixed CRITICAL goes to apply_, an un-triaged CRITICAL escalates
+esc2, app2 = s.classify([crit({"auto_fixable": True}), crit()])
+check("autofix routed to apply", (len(esc2), len(app2)), (1, 1))
+# a needs-human status never auto-fixes, even if mislabeled
+esc3, _ = s.classify([{"severity": None, "status": "unparseable", "autofix": {"auto_fixable": True}}])
+check("unparseable never auto-fixed", len(esc3), 1)
+
+# has_blocking_activity: an auto-fixed CRITICAL still counts (no false convergence)
+check("blocking incl auto-fixed", s.has_blocking_activity([crit({"auto_fixable": True})]), True)
+check("blocking false for low-only", s.has_blocking_activity(s.parse_findings("- [SUGGESTION/style] x")), False)
+# tag_str annotates an auto-fixed finding
+check("tag_str autofix marker", s.tag_str(crit({"auto_fixable": True})), "CRITICAL (auto-fix)")
+check("tag_str no marker untriaged", s.tag_str(crit()), "CRITICAL")
+
 # ── classify ──────────────────────────────────────────────────────────
 esc, app = s.classify(s.parse_findings(
     "- [WARNING/correctness] a\n- [SUGGESTION/test] b\n- [MAJOR/x] c\n- [SUGGESTION/style] d"))
