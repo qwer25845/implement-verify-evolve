@@ -54,6 +54,14 @@ check("approve + warning", rl.verdict_anomaly("APPROVE", sc.parse_findings("- [W
 check("approve clean ok", rl.verdict_anomaly("APPROVE", sc.parse_findings("- [SUGGESTION/test] a")), False)
 check("request_changes + findings ok", rl.verdict_anomaly("REQUEST_CHANGES", sc.parse_findings("- [WARNING/x] a")), False)
 
+# author E-gate parse: BOTH lines must be explicitly affirmative (fail-safe hole fix)
+check("author both yes -> ok", rl._autofix_author_ok("DETERMINATE: yes\nAGREE: yes"), True)
+check("author agree no -> fail", rl._autofix_author_ok("DETERMINATE: yes\nAGREE: no"), False)
+check("author determinate no -> fail", rl._autofix_author_ok("DETERMINATE: no\nAGREE: yes"), False)
+check("author missing determinate -> fail-safe", rl._autofix_author_ok("AGREE: yes"), False)
+check("author missing agree -> fail-safe", rl._autofix_author_ok("DETERMINATE: yes"), False)
+check("author empty -> fail-safe", rl._autofix_author_ok(""), False)
+
 # auto_fix interlock: opt-out (default ON) only when an author_cmd exists; explicit wins
 check("auto_fix off when no author_cmd", rl.auto_fix_enabled({}), False)
 check("auto_fix on by default with author_cmd", rl.auto_fix_enabled({"author_cmd": ["x"]}), True)

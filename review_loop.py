@@ -164,8 +164,16 @@ def _author_agrees_fix(text, fix, cfg, work_dir):
         "AGREE: yes/no         (do you agree this fix may be applied automatically "
         "without a human?)\n\n"
         f"Finding: {text or ''}\nProposed fix: {fix or '(unspecified)'}")
-    out = _run_author(prompt, cfg, work_dir, ".autofix_author_prompt.txt")
-    return _yesno(out, "AGREE") is True and _yesno(out, "DETERMINATE") is not False
+    return _autofix_author_ok(_run_author(prompt, cfg, work_dir, ".autofix_author_prompt.txt"))
+
+
+def _autofix_author_ok(out):
+    """Parse the author's structured E-gate reply. Fail-safe: BOTH the AGREE and
+    DETERMINATE lines must be EXPLICITLY affirmative. A missing/None line (an
+    incomplete or malformed author reply) counts as disagreement, so it never
+    permits a high-severity auto-fix — honoring the rubric's 'missing information
+    escalates' policy."""
+    return _yesno(out, "AGREE") is True and _yesno(out, "DETERMINATE") is True
 
 
 def _yesno(out, key):
