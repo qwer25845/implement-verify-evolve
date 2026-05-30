@@ -86,9 +86,21 @@ def _reclassify_call(text, cfg, work_dir):
     env = dict(os.environ)
     env.update(cfg.get("reviewer_env", {}))
     z = _run(cmd, cwd=cfg.get("reviewer_cwd"), env=env, timeout=cfg.get("timeout", 420))
-    # Robust: collect documented types by first appearance (reviewers don't always
-    # obey "no prose"); join up to two with the connector they used. None == UNCLASSIFIABLE.
-    out = (z.stdout or "").lower()
+    return _parse_reclassify_reply(z.stdout)
+
+
+def _parse_reclassify_reply(out):
+    """Parse a reclassification reply into a type spec ('a' / 'a+b' / 'a|b') or
+    None (escalate). Robust: documented types are collected by first appearance
+    (reviewers don't always obey "no prose"), up to two joined with the connector
+    they used.
+
+    Fail-safe: an explicit UNCLASSIFIABLE escalates (returns None) even if a stray
+    type word also appears (e.g. "UNCLASSIFIABLE, maybe reliability"), so an
+    ambiguous/hedged reply can never bypass the reclassify-failed human escalation."""
+    out = (out or "").lower()
+    if re.search(r"\bunclassifiable\b", out):
+        return None
     hits = sorted((m.start(), t) for t in scoring.DOCUMENTED_TYPES
                   for m in [re.search(r"\b" + re.escape(t) + r"\b", out)] if m)
     found = [t for _, t in hits][:2]
@@ -311,6 +323,11 @@ def run_round(cfg, work_dir):
             findings,
             lambda t: _reclassify_call(t, cfg, work_dir),
             lambda t, tag: _author_agrees(t, tag, cfg, work_dir))
+    # Multi-category tags the reviewer proposed DIRECTLY ([SEV/A+B], [SEV/A|B]) are
+    # settled by the same two-LLM handshake: the author must agree, else escalate
+    # (SCORING_RUBRIC.md "Multi-category findings"). No-op when none are present.
+    findings = scoring.settle_multi_type(
+        findings, lambda t, tag: _author_agrees(t, tag, cfg, work_dir))
     # Auto-fix triage: a CRITICAL/WARNING may be self-repaired instead of escalated
     # when the five gates hold. Gate C (verifiable) is mandatory for a semantic
     # change and waived only for a purely non-semantic text fix. See SCORING_RUBRIC.md

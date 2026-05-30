@@ -31,6 +31,15 @@ check("unknown severity", statuses("- [MAJOR/correctness] x"),
       [("MAJOR", "correctness", "unknown_severity")])
 check("unknown type", statuses("- [SUGGESTION/perf] x"),
       [("SUGGESTION", "perf", "unknown_type")])
+# CRITICAL/WARNING also follow the unknown-type contract (no silent 'ok')
+check("WARNING undocumented type -> unknown_type", statuses("- [WARNING/perf] x"),
+      [("WARNING", "perf", "unknown_type")])
+check("CRITICAL no type -> unknown_type", statuses("- [CRITICAL] x"),
+      [("CRITICAL", None, "unknown_type")])
+check("WARNING documented type stays ok", statuses("- [WARNING/security] x"),
+      [("WARNING", "security", "ok")])
+check("CRITICAL unknown_type keeps fixed weight",
+      s.weight_of({"severity": "CRITICAL", "type": "perf", "status": "unknown_type"}), 100)
 check("numbered list", [f["status"] for f in s.parse_findings("1. [CRITICAL/correctness] x")],
       ["unparseable"])
 check("star bullet", [f["status"] for f in s.parse_findings("* [WARNING/correctness] x")],
@@ -105,6 +114,23 @@ check("reclassify -> multi sum",
       [(["reliability", "test"], "sum", "ok")])
 check("reclassify multi with undocumented -> failed",
       [g["status"] for g in s.reclassify(uf, _stub("reliability+perf"))], ["reclassify_failed"])
+
+# ── multi-type handshake: direct A+B needs author agreement, else escalate ──
+md = s.parse_findings("- [SUGGESTION/security+test] leaks a key and has no test")
+check("multi-type pre-handshake ok", md[0]["status"], "ok")
+check("multi-type author agrees -> ok",
+      [f["status"] for f in s.settle_multi_type(md, lambda _t, _tag: True)], ["ok"])
+check("multi-type author disagrees -> agreement_failed",
+      [f["status"] for f in s.settle_multi_type(md, lambda _t, _tag: False)], ["agreement_failed"])
+check("agreement_failed needs_human", s.needs_human([{"status": "agreement_failed"}]), True)
+check("agreement_failed weight escalates", s.weight_of({"status": "agreement_failed"}), CFG["escalate_min"])
+check("agreement_failed tag", s.tag_str({"status": "agreement_failed"}), "AGREEMENT_FAILED")
+check("single-type untouched by settle",
+      [f["status"] for f in s.settle_multi_type(s.parse_findings("- [SUGGESTION/test] a"), lambda _t, _tag: False)], ["ok"])
+# a multi-type already settled via reclassify is not re-settled
+_rc = s.reclassify(s.parse_findings("- [SUGGESTION/perf] x"), _stub("reliability+test"), lambda _t, _tag: True)
+check("reclassified multi not re-settled",
+      [f["status"] for f in s.settle_multi_type(_rc, lambda _t, _tag: False)], ["ok"])
 
 # ── two-LLM agreement: author must agree, else escalate ────────────────
 _agree = lambda _t, _tag: True

@@ -54,6 +54,13 @@ check("approve + warning", rl.verdict_anomaly("APPROVE", sc.parse_findings("- [W
 check("approve clean ok", rl.verdict_anomaly("APPROVE", sc.parse_findings("- [SUGGESTION/test] a")), False)
 check("request_changes + findings ok", rl.verdict_anomaly("REQUEST_CHANGES", sc.parse_findings("- [WARNING/x] a")), False)
 
+# reclassify reply parse: explicit UNCLASSIFIABLE escalates even with a stray type word
+check("reclassify reply clean", rl._parse_reclassify_reply("reliability"), "reliability")
+check("reclassify reply UNCLASSIFIABLE -> None", rl._parse_reclassify_reply("UNCLASSIFIABLE"), None)
+check("reclassify reply hedged UNCLASSIFIABLE -> None", rl._parse_reclassify_reply("UNCLASSIFIABLE, maybe reliability"), None)
+check("reclassify reply multi-sum", rl._parse_reclassify_reply("security+test"), "security+test")
+check("reclassify reply empty -> None", rl._parse_reclassify_reply(""), None)
+
 # author E-gate parse: BOTH lines must be explicitly affirmative (fail-safe hole fix)
 check("author both yes -> ok", rl._autofix_author_ok("DETERMINATE: yes\nAGREE: yes"), True)
 check("author agree no -> fail", rl._autofix_author_ok("DETERMINATE: yes\nAGREE: no"), False)

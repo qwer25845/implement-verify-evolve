@@ -100,7 +100,11 @@ def parse_findings(text):
             desc = s[m.end():].strip()
             if sev not in KNOWN_SEVERITIES:
                 findings.append({"severity": sev, "type": typ_raw, "status": "unknown_severity", "text": desc})
-            elif sev == "SUGGESTION":
+            else:
+                # Every known severity requires a documented TYPE. SUGGESTION weight
+                # depends on it; CRITICAL/WARNING use the fixed severity weight but
+                # still follow the same unknown-type contract (re-classify once, else
+                # escalate) so a missing/undocumented type is never silently 'ok'.
                 types, rel = parse_type_spec(typ_raw)
                 if types and all(t in DOCUMENTED_TYPES for t in types):
                     f = {"severity": sev, "status": "ok", "text": desc}
@@ -111,8 +115,6 @@ def parse_findings(text):
                     findings.append(f)
                 else:  # missing or some undocumented type -> re-classify once, else escalate
                     findings.append({"severity": sev, "type": typ_raw, "status": "unknown_type", "text": desc})
-            else:  # CRITICAL / WARNING use the fixed severity weight regardless of type
-                findings.append({"severity": sev, "type": typ_raw, "status": "ok", "text": desc})
             continue
         # Not strict. Treat as a malformed finding (never silently drop) when it is
         # either a finding-like bullet without a clean tag (e.g. "- Missing test",
@@ -164,7 +166,7 @@ def reclassify(findings, classifier, agreer=None, cfg=DEFAULT_CONFIG):
 
 def weight_of(finding, cfg=DEFAULT_CONFIG):
     st = finding.get("status", "ok")
-    if st in ("unknown_severity", "unparseable", "reclassify_failed"):
+    if st in ("unknown_severity", "unparseable", "reclassify_failed", "agreement_failed"):
         return cfg["escalate_min"]            # never 0 — force attention
     sev, typ = finding.get("severity"), finding.get("type")
     if sev in ("CRITICAL", "WARNING"):
@@ -182,9 +184,32 @@ def weight_of(finding, cfg=DEFAULT_CONFIG):
 
 def needs_human(findings):
     """True if any finding could not be judged by the table (incl. an
-    unknown_type that failed re-classification)."""
-    return any(f.get("status") in ("unknown_severity", "unparseable", "reclassify_failed")
+    unknown_type that failed re-classification, or a multi-type the author would
+    not agree to)."""
+    return any(f.get("status") in ("unknown_severity", "unparseable",
+                                   "reclassify_failed", "agreement_failed")
                for f in findings)
+
+
+def settle_multi_type(findings, agreer, cfg=DEFAULT_CONFIG):
+    """Apply the two-LLM agreement handshake to well-formed multi-type findings the
+    reviewer proposed DIRECTLY (i.e. not via reclassify, which already runs the
+    handshake). The reviewer proposed ``[SEV/A+B]`` or ``[SEV/A|B]``; the author
+    (LLM A) must agree. On agreement the score stands; on disagreement the finding
+    escalates (status ``agreement_failed`` -> needs human), honoring the rubric:
+    a multi-category finding is settled by a handshake. With no author configured
+    the agreer honors the proposal (returns True)."""
+    out = []
+    for f in findings:
+        if (f.get("types") and f.get("status") == "ok"
+                and not f.get("agreed") and not f.get("reclassified")):
+            if agreer(f.get("text", ""), tag_str(f)):
+                out.append({**f, "agreed": True})
+            else:
+                out.append({**f, "status": "agreement_failed", "disagreed": True})
+        else:
+            out.append(f)
+    return out
 
 
 # ── Auto-fixable CRITICAL/WARNING (see SCORING_RUBRIC.md) ──────────────────
@@ -300,6 +325,8 @@ def tag_str(finding):
         return "UNPARSEABLE"
     if st == "reclassify_failed":
         return "RECLASSIFY_FAILED"
+    if st == "agreement_failed":
+        return "AGREEMENT_FAILED"
     if st == "unknown_severity":
         return f"UNKNOWN_SEV:{finding.get('severity')}"
     sev = finding.get("severity")

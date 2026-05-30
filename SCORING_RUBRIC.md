@@ -116,13 +116,14 @@ The table is fail-safe: **ambiguity escalates, it never silently scores 0.**
    `BLOCKER`, `NIT`): do **not** score 0. Weight = `escalate_min` and the round
    is flagged `needs_human` — an unrecognised severity is treated as at least
    human-review-worthy.
-2. **Missing or unknown TYPE** on a `SUGGESTION` (`[SUGGESTION]` with no type, or
-   e.g. `SUGGESTION/perf`): TYPE is mandatory, so the finding gets **one more
-   precise re-classification pass** (the reviewer is asked to map it to exactly
-   one documented type). If that succeeds the finding takes the documented type
-   and is scored normally; if it still cannot be classified it becomes
-   `reclassify_failed` → **escalates** (needs human). It is never silently scored
-   low.
+2. **Missing or unknown TYPE** on any finding (`[SUGGESTION]` with no type,
+   `[SUGGESTION/perf]`, `[WARNING/perf]`, `[CRITICAL]` with no type, …): TYPE is
+   mandatory for every severity, so the finding gets **one more precise
+   re-classification pass** (the reviewer is asked to map it to exactly one
+   documented type). If that succeeds the finding takes the documented type and is
+   scored normally (a `CRITICAL`/`WARNING` keeps its fixed severity weight); if it
+   still cannot be classified it becomes `reclassify_failed` → **escalates** (needs
+   human). It is never silently accepted as `ok`.
 3. **Malformed / unparseable finding-like line** (`*`/numbered bullet, a
    `[SEVERITY/TYPE]` buried in prose, missing brackets): collected as
    `UNPARSEABLE`. Any UNPARSEABLE line flags the round `needs_human` (the
@@ -185,8 +186,14 @@ A `CRITICAL`/`WARNING` is **auto-fixable** only if ALL hold:
 - **D. No sensitive surface** — does not change security posture, secrets, auth,
   data migration/deletion, or a public API/contract (where "right" is itself a
   decision).
-- **E. Two-LLM agreement** — reviewer (B) and author (A) both agree on (i) the
-  diagnosis and (ii) that the fix is the single obvious one. (Reuses the handshake
+- **E. Two-LLM agreement** — the reviewer (B) owns the diagnosis (its triage
+  includes a diagnosis-confidence check, `DIAGNOSIS_AGREED`) and proposes the fix;
+  the author (A) then *independently* agrees the fix is the single obvious,
+  determinate change. Auto-fix requires both. The author takes the reviewer's
+  factual diagnosis as given (the reviewer owns diagnosis confidence — asking a
+  second model to re-derive an unseen fact only makes it abstain) and concentrates
+  its independent judgement on whether the repair is unambiguous; this is what
+  catches a "looks obvious but is really a design choice" fix. (Reuses the handshake
   from "Two-LLM agreement" above.)
 
 **Any gate fails → escalate to a human.** Fail-safe: a gate the triage leaves
@@ -233,8 +240,9 @@ Gate C.
 ### How it integrates
 
 - High-severity findings carry an `auto_fixable` axis set by an **auto-fix triage**:
-  the reviewer (B) answers gates A–D + *semantic?* + the exact fix, and the author
-  (A) is asked to agree on the diagnosis and that the fix is the obvious one (E).
+  the reviewer (B) answers gates A–D + *semantic?* + a diagnosis-confidence check +
+  the exact fix, and the author (A) then *independently* agrees the fix is the single
+  obvious determinate change (E), taking the reviewer's factual diagnosis as given.
 - Escalation becomes: **escalate ⟺ (weight ≥ `escalate_min`) AND NOT
   (auto_fixable AND two-LLM-agreed)**. An auto-fixed high finding is routed to the
   *apply* lane (the implementer makes the fix) instead of the *escalate* lane.
