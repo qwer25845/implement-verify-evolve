@@ -125,12 +125,18 @@ def parse_findings(text):
     return findings
 
 
-def reclassify(findings, classifier, cfg=DEFAULT_CONFIG):
+def reclassify(findings, classifier, agreer=None, cfg=DEFAULT_CONFIG):
     """Give every ``unknown_type`` finding ONE more precise classification pass.
 
-    ``classifier(text)`` should return a documented TYPE or None. On success the
-    finding is rewritten to ``ok`` with that type; if it still cannot be
-    classified it becomes ``reclassify_failed`` (which escalates to a human).
+    ``classifier(text)`` returns a documented TYPE spec (``'a'`` / ``'a+b'`` /
+    ``'a|b'``) or None. On success the finding is rewritten to ``ok``.
+
+    ``agreer(text, proposed_tag) -> bool`` is the two-LLM handshake: the code
+    author (LLM A) must agree with the reviewer's (LLM B) classification. When an
+    ``agreer`` is supplied and DISAGREES, the finding escalates
+    (``reclassify_failed``) so a human resolves the disagreement; when it agrees,
+    the classification is finalized and the loop may auto-fix and continue without
+    human escalation. With no ``agreer`` the well-formed proposal is honored.
     """
     out = []
     for f in findings:
@@ -138,17 +144,21 @@ def reclassify(findings, classifier, cfg=DEFAULT_CONFIG):
             out.append(f)
             continue
         types, rel = parse_type_spec(classifier(f.get("text", "")))
-        if types and all(t in DOCUMENTED_TYPES for t in types):
-            g = {**f, "status": "ok", "reclassified": True}
-            g.pop("types", None)
-            g.pop("relation", None)
-            if len(types) == 1:
-                g["type"] = types[0]
-            else:
-                g["type"], g["types"], g["relation"] = None, types, rel
-            out.append(g)
-        else:
+        if not (types and all(t in DOCUMENTED_TYPES for t in types)):
             out.append({**f, "status": "reclassify_failed"})
+            continue
+        g = {**f, "status": "ok", "reclassified": True}
+        g.pop("types", None)
+        g.pop("relation", None)
+        if len(types) == 1:
+            g["type"] = types[0]
+        else:
+            g["type"], g["types"], g["relation"] = None, types, rel
+        if agreer is not None and not agreer(f.get("text", ""), tag_str(g)):
+            out.append({**f, "status": "reclassify_failed", "disagreed": True})
+        else:
+            g["agreed"] = agreer is not None
+            out.append(g)
     return out
 
 

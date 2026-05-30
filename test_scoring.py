@@ -106,6 +106,19 @@ check("reclassify -> multi sum",
 check("reclassify multi with undocumented -> failed",
       [g["status"] for g in s.reclassify(uf, _stub("reliability+perf"))], ["reclassify_failed"])
 
+# ── two-LLM agreement: author must agree, else escalate ────────────────
+_agree = lambda _t, _tag: True
+_disagree = lambda _t, _tag: False
+check("author agrees -> ok",
+      [(g["status"], g.get("agreed")) for g in s.reclassify(uf, _stub("reliability"), _agree)],
+      [("ok", True)])
+check("author disagrees -> escalate",
+      [(g["status"], g.get("disagreed")) for g in s.reclassify(uf, _stub("reliability"), _disagree)],
+      [("reclassify_failed", True)])
+check("disagree needs_human", s.needs_human(s.reclassify(uf, _stub("reliability"), _disagree)), True)
+check("no agreer honors proposal",
+      [g["status"] for g in s.reclassify(uf, _stub("reliability"))], ["ok"])
+
 # ── stop rule (incl. needs_human gate) ────────────────────────────────
 check("low #1", s.decide_stop(4, "APPROVE", 0, False), (False, 1))
 check("low #2 -> stop", s.decide_stop(4, "APPROVE", 1, False), (True, 2))

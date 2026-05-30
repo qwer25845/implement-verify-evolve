@@ -89,6 +89,31 @@ def _reclassify_call(text, cfg, work_dir):
     return ("+" if "+" in out else "|").join(found)
 
 
+def _author_agrees(text, proposed_tag, cfg, work_dir):
+    """Two-LLM handshake: ask the code author (LLM A, via author_cmd) whether it
+    agrees with the reviewer's classification. Returns True/False. If no
+    author_cmd is configured, honor the proposal (returns True)."""
+    if not cfg.get("author_cmd"):
+        return True
+    prompt = ("You are the AUTHOR of the code under review. A reviewer classified "
+              f"this finding as {proposed_tag}. Do you AGREE that classification is "
+              "correct? Reply with ONLY: AGREE or DISAGREE.\n\nFinding: " + (text or ""))
+    pf = os.path.abspath(os.path.join(work_dir, ".author_prompt.txt"))
+    with open(pf, "w", encoding="utf-8") as fh:
+        fh.write(prompt)
+    instruction = (f"Read the file {pf.replace(os.sep, '/')} and follow the "
+                   "instruction inside it exactly.")
+    cmd = [a.replace("{prompt_file}", pf.replace(os.sep, "/")).replace("{prompt_instruction}", instruction)
+           for a in cfg["author_cmd"]]
+    env = dict(os.environ)
+    env.update(cfg.get("author_env", {}))
+    z = _run(cmd, cwd=cfg.get("author_cwd"), env=env, timeout=cfg.get("timeout", 420))
+    out = (z.stdout or "").upper()
+    if re.search(r"\bDISAGREE\b", out):
+        return False
+    return bool(re.search(r"\bAGREE\b", out))
+
+
 def parse_verdict(text):
     """Extract the verdict from a VERDICT: line (must start a line, not appear in
     prose). Returns 'APPROVE' / 'REQUEST_CHANGES' / '?' (the last forces a human)."""
@@ -169,7 +194,10 @@ def run_round(cfg, work_dir):
     # Unknown/missing TYPE gets one precise re-classification pass; if it still
     # cannot be mapped to a documented type it escalates (reclassify_failed).
     if any(f.get("status") == "unknown_type" for f in findings):
-        findings = scoring.reclassify(findings, lambda t: _reclassify_call(t, cfg, work_dir))
+        findings = scoring.reclassify(
+            findings,
+            lambda t: _reclassify_call(t, cfg, work_dir),
+            lambda t, tag: _author_agrees(t, tag, cfg, work_dir))
     nh = scoring.needs_human(findings) or verdict_anomaly(verdict, findings)
     score = scoring.score_review(findings, score_cfg)
     escalate, apply_ = scoring.classify(findings, score_cfg)

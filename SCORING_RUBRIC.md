@@ -99,11 +99,14 @@ score it by whether the two categories are disjoint or overlapping:
   timeout that is both a reliability and a correctness concern →
   `[SUGGESTION/reliability|correctness]` = max(15, 15) = 15.
 
-This applies on the primary tag and on the re-classification pass. The author
-(orchestrator) only honours a multi-type tag when every listed type is
-documented; otherwise it is treated as unclassifiable and escalates. An ambiguous
-multi-spec with no `+` defaults to `|` (max) so it can never silently inflate the
-score.
+**Two-LLM agreement.** A multi-category (and any re-classified) finding is settled
+by a handshake: the reviewer (LLM B) proposes the classification, and the code
+author (LLM A) is asked whether it agrees. If **both agree**, the score is
+finalized and — when it is below the escalation threshold — the loop auto-fixes
+and continues **without human escalation**. If they **disagree**, the finding
+escalates to a human to resolve. (With no author configured, a well-formed
+proposal whose types are all documented is honored.) An ambiguous multi-spec with
+no `+` defaults to `|` (max) so it can never silently inflate the score.
 
 ## Exception handling (cases the table CANNOT judge)
 

@@ -17,6 +17,10 @@
   "reviewer_cwd": null,
   "timeout": 600,
 
+  "author_cmd": ["your-author-llm", "--prompt-file", "{prompt_file}"],
+  "author_env": {},
+  "author_cwd": null,
+
   "include_patch": true,
   "patch_out_dir": ".",
   "review_targets": [],

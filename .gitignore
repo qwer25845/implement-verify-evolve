@@ -6,6 +6,7 @@ config.json
 .review_prompt.txt
 .implementer_prompt.txt
 .reclassify_prompt.txt
+.author_prompt.txt
 review-log.md
 .calibration_state.json
 .calibration_prompt.txt
