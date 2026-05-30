@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 # local config + per-run artifacts (keep config.example.json under version control)
 config.json
+# local working notes (keep local paths / private context out of the public repo)
+CLAUDE.md
+SESSION_HANDOFF.md
 .review_state.json
 .review_prompt.txt
 .implementer_prompt.txt
